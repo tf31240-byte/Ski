@@ -504,12 +504,12 @@ Analysez automatiquement vos sessions de ski : détection de difficulté,
 identification des pistes et statistiques avancées.
 """)
 
-# Upload de fichier
 uploaded_file = st.file_uploader(
     "📂 Importez votre fichier GPX",
-    type=['gpx', 'xml', 'txt'],
-    help="Formats acceptés : GPX, XML ou TXT contenant des données GPS"
+    type=None,  # Accepte TOUS les types de fichiers
+    help="Formats acceptés : GPX, XML, TXT ou tout fichier contenant des données GPS"
 )
+
 
 if uploaded_file is not None:
     try:
