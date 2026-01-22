@@ -1,5 +1,6 @@
 import streamlit as st
 import gpxpy
+import gpxpy.gpx
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -26,6 +27,8 @@ if 'current_session' not in st.session_state:
     st.session_state.current_session = None
 if 'theme' not in st.session_state:
     st.session_state.theme = "Clair"
+if 'piste_names' not in st.session_state:
+    st.session_state.piste_names = {}
 
 # --- STYLES CSS AMÉLIORÉS ---
 def apply_theme(theme):
@@ -191,27 +194,67 @@ def fetch_osm_piste_name(lat, lon, timeout=3):
         return f"❌ Erreur OSM"
 
 def get_weather_data(lat, lon):
-    """Récupère les conditions météo via Open-Meteo API"""
+    """Récupère les conditions météo via Open-Meteo API (amélioré)"""
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
-        'latitude': lat,
-        'longitude': lon,
-        'daily': 'temperature_2m_max,temperature_2m_min,precipitation_sum,snowfall_sum',
+        'latitude': round(lat, 4),
+        'longitude': round(lon, 4),
+        'daily': 'temperature_2m_max,temperature_2m_min,precipitation_sum,snowfall_sum,windspeed_10m_max',
+        'current_weather': 'true',
         'timezone': 'auto',
         'forecast_days': 1
     }
     
     try:
-        response = requests.get(url, params=params, timeout=5)
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
         data = response.json()
-        return {
-            'temp_max': data['daily']['temperature_2m_max'][0],
-            'temp_min': data['daily']['temperature_2m_min'][0],
-            'precip': data['daily']['precipitation_sum'][0],
-            'snow': data['daily']['snowfall_sum'][0]
+        
+        weather_info = {
+            'temp_max': round(data['daily']['temperature_2m_max'][0], 1),
+            'temp_min': round(data['daily']['temperature_2m_min'][0], 1),
+            'precip': round(data['daily']['precipitation_sum'][0], 1),
+            'snow': round(data['daily']['snowfall_sum'][0], 1),
+            'wind': round(data['daily']['windspeed_10m_max'][0], 1)
         }
-    except:
+        
+        if 'current_weather' in data:
+            weather_info['current_temp'] = round(data['current_weather']['temperature'], 1)
+            weather_info['current_wind'] = round(data['current_weather']['windspeed'], 1)
+        
+        return weather_info
+        
+    except requests.exceptions.Timeout:
         return None
+    except Exception as e:
+        return None
+
+def calculate_g_forces(df):
+    """Calcule les forces G (accélérations)"""
+    df = df.copy()
+    
+    # Accélération longitudinale
+    df['speed_ms'] = df['speed_kmh'] / 3.6
+    df['acceleration_ms2'] = df['speed_ms'].diff() / df['dt'].replace(0, np.nan)
+    df['g_force_lateral'] = df['acceleration_ms2'] / 9.81
+    
+    # Accélération verticale
+    df['vertical_speed_ms'] = df['ele_diff'] / df['dt'].replace(0, np.nan)
+    df['vertical_acceleration'] = df['vertical_speed_ms'].diff() / df['dt'].replace(0, np.nan)
+    df['g_force_vertical'] = df['vertical_acceleration'] / 9.81
+    
+    # G total
+    df['g_force_total'] = np.sqrt(
+        df['g_force_lateral'].fillna(0)**2 + 
+        df['g_force_vertical'].fillna(0)**2
+    )
+    
+    df['g_force_total'] = smooth_data(
+        df['g_force_total'].fillna(0).clip(-5, 5), 
+        window=5
+    )
+    
+    return df
 
 def detect_jumps(df, threshold=2):
     """Détecte les sauts basés sur l'accélération verticale"""
@@ -234,7 +277,7 @@ def detect_jumps(df, threshold=2):
         elif row['acceleration'] > threshold and in_air and jump_start is not None:
             in_air = False
             air_time = (df.loc[idx, 'time'] - df.loc[jump_start, 'time']).total_seconds()
-            if air_time > 0.5 and air_time < 5:  # Entre 0.5s et 5s
+            if air_time > 0.5 and air_time < 5:
                 jumps.append({
                     'time': df.loc[jump_start, 'time'],
                     'air_time': round(air_time, 2),
@@ -263,6 +306,40 @@ def detect_rest_zones(df):
     
     return pd.DataFrame(rest_zones)
 
+def detect_sharp_turns(df, threshold=30):
+    """Détecte les virages serrés basés sur le changement de direction"""
+    df = df.copy()
+    
+    # Calcul du bearing (direction)
+    df['bearing'] = np.arctan2(
+        df['lon'] - df['prev_lon'],
+        df['lat'] - df['prev_lat']
+    ) * 180 / np.pi
+    
+    df['bearing_change'] = df['bearing'].diff().abs()
+    df['bearing_change'] = df['bearing_change'].apply(lambda x: min(x, 360 - x) if pd.notna(x) else 0)
+    
+    # Virages > threshold degrés
+    turns = df[(df['bearing_change'] > threshold) & (df['state'] == 'Ski')].copy()
+    
+    if turns.empty:
+        return pd.DataFrame()
+    
+    # Grouper les virages proches
+    turns['turn_group'] = (turns['time'].diff() > pd.Timedelta(seconds=3)).cumsum()
+    
+    result = []
+    for _, group in turns.groupby('turn_group'):
+        result.append({
+            'time': group['time'].iloc[0],
+            'lat': group['lat'].mean(),
+            'lon': group['lon'].mean(),
+            'angle': round(group['bearing_change'].max(), 1),
+            'speed': round(group['speed_kmh'].mean(), 1)
+        })
+    
+    return pd.DataFrame(result)
+
 def calculate_session_score(runs_df, df):
     """Calcule un score global de la session"""
     score = 0
@@ -283,6 +360,23 @@ def calculate_session_score(runs_df, df):
     score += variety * 5
     
     return min(int(score), 100)
+
+def estimate_calories(runs_df, df, user_weight=75):
+    """Estime les calories brûlées"""
+    total_time_hours = df[df['state'] == 'Ski']['dt'].sum() / 3600
+    avg_speed = df[df['state'] == 'Ski']['speed_kmh'].mean()
+    
+    # MET ajusté selon la vitesse
+    if avg_speed > 40:
+        met = 8
+    elif avg_speed > 25:
+        met = 6.5
+    else:
+        met = 5
+    
+    calories = met * user_weight * total_time_hours
+    
+    return int(calories)
 
 def get_recommendations(runs_df, df):
     """Suggère des améliorations"""
@@ -403,6 +497,9 @@ def parse_and_enrich_gpx(file_content):
             lambda x: [int(x[1:3], 16), int(x[3:5], 16), int(x[5:7], 16)]
         )
         
+        # Calcul des forces G
+        df = calculate_g_forces(df)
+        
         return df
     
     except Exception as e:
@@ -431,6 +528,10 @@ def detect_runs(df):
         avg_gradient = group['gradient'].abs().mean()
         max_gradient = group['gradient'].abs().max()
         
+        # Forces G
+        max_g = group['g_force_total'].max() if 'g_force_total' in group.columns else 0
+        avg_g = group['g_force_total'].mean() if 'g_force_total' in group.columns else 0
+        
         dominant_color = group['color_name'].mode()[0] if not group['color_name'].mode().empty else "Inconnue"
         
         color_distribution = group['color_name'].value_counts(normalize=True) * 100
@@ -454,6 +555,8 @@ def detect_runs(df):
             'Vitesse Max (km/h)': int(max_speed),
             'Pente Moy (%)': round(avg_gradient, 1),
             'Pente Max (%)': round(max_gradient, 1),
+            'G Max': round(max_g, 2),
+            'G Moyen': round(avg_g, 2),
             'Couleur Dominante': dominant_color,
             'Distribution Couleurs': color_distribution.to_dict(),
             'lat_center': mid_point['lat'],
@@ -567,178 +670,301 @@ def create_session_score_gauge(score):
     fig.update_layout(height=300)
     return fig
 
-def create_3d_map(df):
-    """Crée une carte 3D interactive avec PyDeck"""
-    ski_data = df[df['state'] == 'Ski'].copy()
-    
-    if ski_data.empty:
+def create_run_comparison(runs_df):
+    """Compare les descentes entre elles"""
+    if len(runs_df) < 2:
         return None
     
-    # Layer de trajectoire
-    path_layer = pdk.Layer(
-        "PathLayer",
-        data=ski_data,
-        pickable=True,
-        get_path=ski_data[['lon', 'lat']].values.tolist(),
-        get_color='color_rgb',
-        width_scale=20,
-        width_min_pixels=3,
-        get_width=5,
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=runs_df['N°'],
+        y=runs_df['Vitesse Max (km/h)'],
+        name='Vitesse Max',
+        marker_color='#667eea'
+    ))
+    
+    fig.add_trace(go.Bar(
+        x=runs_df['N°'],
+        y=runs_df['Dénivelé (m)'],
+        name='Dénivelé',
+        marker_color='#FF6B6B',
+        yaxis='y2'
+    ))
+    
+    fig.update_layout(
+        title='Comparaison des Descentes',
+        xaxis_title='Numéro de descente',
+        yaxis=dict(title='Vitesse (km/h)'),
+        yaxis2=dict(title='Dénivelé (m)', overlaying='y', side='right'),
+        barmode='group',
+        height=350,
+        template='plotly_white'
     )
     
-    # Heatmap de vitesse
-    heatmap_layer = pdk.Layer(
-        "HeatmapLayer",
-        data=ski_data,
-        get_position=['lon', 'lat'],
-        get_weight='speed_kmh',
-        radius_pixels=50,
-        intensity=1,
-        threshold=0.05,
-        opacity=0.5
-    )
-    
-    # Points de départ/arrivée
-    start_end_data = pd.DataFrame([
-        {'lon': ski_data.iloc[0]['lon'], 'lat': ski_data.iloc[0]['lat'], 'color': [0, 255, 0, 200], 'type': 'Départ'},
-        {'lon': ski_data.iloc[-1]['lon'], 'lat': ski_data.iloc[-1]['lat'], 'color': [255, 0, 0, 200], 'type': 'Arrivée'}
-    ])
-    
-    marker_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=start_end_data,
-        get_position=['lon', 'lat'],
-        get_color='color',
-        get_radius=50,
-        pickable=True,
-    )
-    
-    view_state = pdk.ViewState(
-        latitude=ski_data['lat'].mean(),
-        longitude=ski_data['lon'].mean(),
-        zoom=13,
-        pitch=60,
-        bearing=0
-    )
-    
-    r = pdk.Deck(
-        layers=[heatmap_layer, path_layer, marker_layer],
-        initial_view_state=view_state,
-        tooltip={
-            "text": "Vitesse: {speed_kmh:.1f} km/h\nAltitude: {ele:.0f} m\nPente: {gradient:.1f}%"
-        },
-        map_style="mapbox://styles/mapbox/satellite-streets-v12"
-    )
-    
-    return r
+    return fig
 
+def create_performance_heatmap(runs_df):
+    """Heatmap des performances par descente"""
+    if len(runs_df) < 3:
+        return None
+    
+    metrics = ['Vitesse Max (km/h)', 'Dénivelé (m)', 'Pente Max (%)', 'G Max']
+    heatmap_data = runs_df[metrics].copy()
+    
+    for col in metrics:
+        heatmap_data[col] = (heatmap_data[col] - heatmap_data[col].min()) / (heatmap_data[col].max() - heatmap_data[col].min()) * 100
+    
+    fig = go.Figure(data=go.Heatmap(
+        z=heatmap_data.T.values,
+        x=runs_df['N°'],
+        y=[m.replace(' (km/h)', '').replace(' (m)', '').replace(' (%)', '') for m in metrics],
+        colorscale='Viridis',
+        text=heatmap_data.T.values,
+        texttemplate='%{text:.0f}',
+        textfont={"size": 10},
+        colorbar=dict(title="Score")
+    ))
+    
+    fig.update_layout(
+        title='Carte de Chaleur des Performances',
+        xaxis_title='Descente N°',
+        height=300,
+        template='plotly_white'
+    )
+    
+    return fig
+
+def create_timeline(runs_df, df):
+    """Timeline interactive de la journée"""
+    fig = go.Figure()
+    
+    # Descentes
+    for _, run in runs_df.iterrows():
+        fig.add_trace(go.Scatter(
+            x=[run['Début'], run​​​​​​​​​​​​​​​​
+[‘Fin’]],
+y=[run[‘N°’], run[‘N°’]],
+mode=‘lines+markers’,
+name=f”Descente {run[‘N°’]}”,
+line=dict(width=8),
+marker=dict(size=12),
+hovertemplate=f”<b>Descente {run[‘N°’]}</b><br>” +
+f”Couleur: {run[‘Couleur Dominante’]}<br>” +
+f”Vitesse max: {run[‘Vitesse Max (km/h)’]} km/h<br>” +
+f”Dénivelé: {run[‘Dénivelé (m)’]} m<br>” +
+“<extra></extra>”
+))
+
+# Remontées
+lifts = df[df['state'] == 'Remontée'].copy()
+if not lifts.empty:
+    lifts['lift_group'] = (lifts['state'] != lifts['state'].shift()).cumsum()
+    for _, group in lifts.groupby('lift_group'):
+        if len(group) > 1:
+            fig.add_trace(go.Scatter(
+                x=[group['time'].iloc[0], group['time'].iloc[-1]],
+                y=[0, 0],
+                mode='lines',
+                name='Remontée',
+                line=dict(width=3, dash='dash', color='gray'),
+                showlegend=False
+            ))
+
+fig.update_layout(
+    title='Timeline de la Journée',
+    xaxis_title='Heure',
+    yaxis_title='Descente N°',
+    height=400,
+    template='plotly_white',
+    hovermode='closest'
+)
+
+return fig
+def create_3d_map(df):
+“”“Crée une carte 3D interactive avec PyDeck”””
+ski_data = df[df[‘state’] == ‘Ski’].copy()
+if ski_data.empty:
+    return None
+
+path_layer = pdk.Layer(
+    "PathLayer",
+    data=ski_data,
+    pickable=True,
+    get_path=ski_data[['lon', 'lat']].values.tolist(),
+    get_color='color_rgb',
+    width_scale=20,
+    width_min_pixels=3,
+    get_width=5,
+)
+
+heatmap_layer = pdk.Layer(
+    "HeatmapLayer",
+    data=ski_data,
+    get_position=['lon', 'lat'],
+    get_weight='speed_kmh',
+    radius_pixels=50,
+    intensity=1,
+    threshold=0.05,
+    opacity=0.5
+)
+
+start_end_data = pd.DataFrame([
+    {'lon': ski_data.iloc[0]['lon'], 'lat': ski_data.iloc[0]['lat'], 'color': [0, 255, 0, 200], 'type': 'Départ'},
+    {'lon': ski_data.iloc[-1]['lon'], 'lat': ski_data.iloc[-1]['lat'], 'color': [255, 0, 0, 200], 'type': 'Arrivée'}
+])
+
+marker_layer = pdk.Layer(
+    "ScatterplotLayer",
+    data=start_end_data,
+    get_position=['lon', 'lat'],
+    get_color='color',
+    get_radius=50,
+    pickable=True,
+)
+
+view_state = pdk.ViewState(
+    latitude=ski_data['lat'].mean(),
+    longitude=ski_data['lon'].mean(),
+    zoom=13,
+    pitch=60,
+    bearing=0
+)
+
+r = pdk.Deck(
+    layers=[heatmap_layer, path_layer, marker_layer],
+    initial_view_state=view_state,
+    tooltip={
+        "text": "Vitesse: {speed_kmh:.1f} km/h\nAltitude: {ele:.0f} m\nPente: {gradient:.1f}%"
+    },
+    map_style="mapbox://styles/mapbox/satellite-streets-v12"
+)
+
+return r
 def export_to_csv(runs_df):
-    """Exporte les résultats en CSV"""
-    export_df = runs_df[[
-        'N°', 'Début', 'Fin', 'Durée', 'Dénivelé (m)', 
-        'Distance (m)', 'Vitesse Moy (km/h)', 'Vitesse Max (km/h)',
-        'Pente Moy (%)', 'Couleur Dominante'
-    ]].copy()
-    
-    return export_df.to_csv(index=False).encode('utf-8')
-
+“”“Exporte les résultats en CSV”””
+export_df = runs_df[[
+‘N°’, ‘Début’, ‘Fin’, ‘Durée’, ‘Dénivelé (m)’,
+‘Distance (m)’, ‘Vitesse Moy (km/h)’, ‘Vitesse Max (km/h)’,
+‘Pente Moy (%)’, ‘Couleur Dominante’, ‘G Max’
+]].copy()
+return export_df.to_csv(index=False).encode('utf-8')
 def export_session_json(runs_df, df, score):
-    """Exporte la session complète en JSON"""
-    session_data = {
-        'date': df['time'].iloc[0].isoformat(),
-        'score': score,
-        'stats': {
-            'total_runs': len(runs_df),
-            'total_descent': int(df['cumulative_descent'].max()),
-            'total_distance': round(df['cumulative_dist'].max(), 2),
-            'max_speed': round(df['speed_kmh'].max(), 1),
-            'max_altitude': int(df['ele'].max())
-        },
-        'runs': runs_df[[
-            'N°', 'Dénivelé (m)', 'Distance (m)', 
-            'Vitesse Max (km/h)', 'Couleur Dominante'
-        ]].to_dict('records')
-    }
-    
-    return json.dumps(session_data, indent=2).encode('utf-8')
+“”“Exporte la session complète en JSON”””
+session_data = {
+‘date’: df[‘time’].iloc[0].isoformat(),
+‘score’: score,
+‘stats’: {
+‘total_runs’: len(runs_df),
+‘total_descent’: int(df[‘cumulative_descent’].max()),
+‘total_distance’: round(df[‘cumulative_dist’].max(), 2),
+‘max_speed’: round(df[‘speed_kmh’].max(), 1),
+‘max_altitude’: int(df[‘ele’].max()),
+‘max_g_force’: round(df[‘g_force_total’].max(), 2)
+},
+‘runs’: runs_df[[
+‘N°’, ‘Dénivelé (m)’, ‘Distance (m)’,
+‘Vitesse Max (km/h)’, ‘Couleur Dominante’, ‘G Max’
+]].to_dict(‘records’)
+}
+return json.dumps(session_data, indent=2).encode('utf-8')
+def export_filtered_gpx(df, state_filter=‘Ski’):
+“”“Exporte uniquement les descentes en GPX”””
+filtered = df[df[‘state’] == state_filter].copy()
+gpx = gpxpy.gpx.GPX()
+gpx_track = gpxpy.gpx.GPXTrack()
+gpx.tracks.append(gpx_track)
+gpx_segment = gpxpy.gpx.GPXTrackSegment()
+gpx_track.segments.append(gpx_segment)
 
-# --- SIDEBAR ---
+for _, row in filtered.iterrows():
+    gpx_segment.points.append(gpxpy.gpx.GPXTrackPoint(
+        row['lat'], 
+        row['lon'], 
+        elevation=row['ele'],
+        time=row['time']
+    ))
+
+return gpx.to_xml()
+— SIDEBAR —
 with st.sidebar:
-    st.image("https://img.icons8.com/color/96/000000/skiing.png", width=80)
-    st.title("⚙️ Paramètres")
+st.image(“https://img.icons8.com/color/96/000000/skiing.png”, width=80)
+st.title(“⚙️ Paramètres”)
+# Thème
+st.markdown("---")
+st.subheader("🎨 Apparence")
+theme = st.selectbox(
+    "Thème",
+    ["Clair", "Sombre", "Montagne"],
+    index=["Clair", "Sombre", "Montagne"].index(st.session_state.theme)
+)
+if theme != st.session_state.theme:
+    st.session_state.theme = theme
+    st.rerun()
+
+st.markdown("---")
+st.subheader("🔧 Filtres de détection")
+
+min_duration = st.slider(
+    "Durée minimale (s)", 
+    10, 120, MIN_RUN_DURATION,
+    help="Durée minimale d'une descente valide"
+)
+
+min_drop = st.slider(
+    "Dénivelé minimal (m)", 
+    10, 200, MIN_RUN_DROP,
+    help="Dénivelé minimal d'une descente valide"
+)
+
+st.markdown("---")
+st.subheader("👤 Profil")
+user_weight = st.number_input("Votre poids (kg)", 40, 150, 75)
+
+st.markdown("---")
+st.subheader("📊 Affichage")
+
+show_3d = st.checkbox("Carte 3D", value=True)
+show_heatmap = st.checkbox("Heatmap de vitesse", value=True)
+show_stats = st.checkbox("Statistiques détaillées", value=True)
+show_jumps = st.checkbox("Détection de sauts", value=False)
+show_weather = st.checkbox("Données météo", value=False)
+show_g_forces = st.checkbox("Force G (accélération)", value=False)
+show_turns = st.checkbox("Virages serrés", value=False)
+
+# Historique des sessions
+st.markdown("---")
+st.subheader("📚 Historique")
+
+if len(st.session_state.sessions) > 0:
+    st.write(f"**{len(st.session_state.sessions)} session(s) enregistrée(s)**")
     
-    # Thème
-    st.markdown("---")
-    st.subheader("🎨 Apparence")
-    theme = st.selectbox(
-        "Thème",
-        ["Clair", "Sombre", "Montagne"],
-        index=["Clair", "Sombre", "Montagne"].index(st.session_state.theme)
-    )
-    if theme != st.session_state.theme:
-        st.session_state.theme = theme
+    for i, session in enumerate(st.session_state.sessions):
+        with st.expander(f"Session {i+1} - {session['date'].strftime('%d/%m/%Y')}"):
+            st.write(f"🏔️ Descentes: {session['runs']}")
+            st.write(f"⬇️ Dénivelé: {session['denivele']:.0f} m")
+            st.write(f"🚀 Vitesse max: {session['vitesse_max']:.1f} km/h")
+            st.write(f"🏆 Score: {session['score']}/100")
+    
+    if st.button("🗑️ Effacer l'historique"):
+        st.session_state.sessions = []
         st.rerun()
-    
-    st.markdown("---")
-    st.subheader("🔧 Filtres de détection")
-    
-    min_duration = st.slider(
-        "Durée minimale (s)", 
-        10, 120, MIN_RUN_DURATION,
-        help="Durée minimale d'une descente valide"
-    )
-    
-    min_drop = st.slider(
-        "Dénivelé minimal (m)", 
-        10, 200, MIN_RUN_DROP,
-        help="Dénivelé minimal d'une descente valide"
-    )
-    
-    st.markdown("---")
-    st.subheader("📊 Affichage")
-    
-    show_3d = st.checkbox("Carte 3D", value=True)
-    show_heatmap = st.checkbox("Heatmap de vitesse", value=True)
-    show_stats = st.checkbox("Statistiques détaillées", value=True)
-    show_jumps = st.checkbox("Détection de sauts", value=False)
-    show_weather = st.checkbox("Données météo", value=False)
-    
-    # Historique des sessions
-    st.markdown("---")
-    st.subheader("📚 Historique")
-    
-    if len(st.session_state.sessions) > 0:
-        st.write(f"**{len(st.session_state.sessions)} session(s) enregistrée(s)**")
-        
-        for i, session in enumerate(st.session_state.sessions):
-            with st.expander(f"Session {i+1} - {session['date'].strftime('%d/%m/%Y')}"):
-                st.write(f"🏔️ Descentes: {session['runs']}")
-                st.write(f"⬇️ Dénivelé: {session['denivele']:.0f} m")
-                st.write(f"🚀 Vitesse max: {session['vitesse_max']:.1f} km/h")
-                st.write(f"🏆 Score: {session['score']}/100")
-        
-        if st.button("🗑️ Effacer l'historique"):
-            st.session_state.sessions = []
-            st.rerun()
-    
-    st.markdown("---")
-    st.info("""
-    **💡 Astuces :**
-    - Exportez en GPX depuis Slopes
-    - OSM identifie les pistes
-    - Ctrl+Clic pour pivoter la 3D
-    - Sauvegardez vos sessions
-    """)
 
-# --- INTERFACE PRINCIPALE ---
-st.title("⛷️ Ski Analytics Pro - Édition IA")
-st.markdown("""
-Analysez automatiquement vos sessions de ski : détection de difficulté, 
-identification des pistes, statistiques avancées et bien plus !
+st.markdown("---")
+st.info("""
+**💡 Astuces :**
+- Exportez en GPX depuis Slopes
+- OSM identifie les pistes
+- Ctrl+Clic pour pivoter la 3D
+- Sauvegardez vos sessions
 """)
-
-uploaded_file = st.file​​​​​​​​​​​​​​​​
-_uploader(
+— INTERFACE PRINCIPALE —
+st.title(“⛷️ Ski Analytics Pro - Édition IA”)
+st.markdown(”””
+Analysez automatiquement vos sessions de ski : détection de difficulté,
+identification des pistes, statistiques avancées et bien plus !
+“””)
+uploaded_file = st.file_uploader(
 “📂 Importez votre fichier GPX”,
 type=None,
 help=“Tous formats acceptés - Le fichier sera analysé automatiquement”
@@ -763,10 +989,13 @@ file_content = uploaded_file.read()
     # Calcul du score
     score = calculate_session_score(runs_df, df)
     
+    # Calories
+    calories = estimate_calories(runs_df, df, user_weight)
+    
     # --- SECTION 1 : STATISTIQUES GLOBALES ---
     st.markdown("### 📊 Vue d'ensemble de la session")
     
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
     
     with col1:
         st.metric("🏔️ Altitude Max", f"{int(df['ele'].max())} m")
@@ -787,18 +1016,57 @@ file_content = uploaded_file.read()
     with col6:
         st.metric("🏆 Score", f"{score}/100")
     
-    # Météo si activé
-    if show_weather:
-        weather = get_weather_data(df['lat'].mean(), df['lon'].mean())
+    with col7:
+        st.metric("🔥 Calories", f"{calories} kcal")
+    
+    # --- MÉTÉO (APRÈS les métriques) ---
+    if show_weather and not df.empty:
+        with st.spinner("🌡️ Récupération météo..."):
+            weather = get_weather_data(df['lat'].mean(), df['lon'].mean())
+        
         if weather:
             st.markdown("---")
-            wcol1, wcol2, wcol3 = st.columns(3)
+            st.markdown("#### 🌤️ Conditions Météo")
+            wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
             with wcol1:
-                st.markdown(f"🌡️ **Température:** {weather['temp_min']}°C - {weather['temp_max']}°C")
+                st.metric("🌡️ Temp Min", f"{weather['temp_min']}°C")
             with wcol2:
-                st.markdown(f"❄️ **Neige:** {weather['snow']} cm")
+                st.metric("🌡️ Temp Max", f"{weather['temp_max']}°C")
             with wcol3:
-                st.markdown(f"🌧️ **Précipitations:** {weather['precip']} mm")
+                st.metric("❄️ Neige", f"{weather['snow']} cm")
+            with wcol4:
+                st.metric("🌧️ Précip", f"{weather['precip']} mm")
+            with wcol5:
+                st.metric("💨 Vent Max", f"{weather['wind']} km/h")
+        else:
+            st.warning("⚠️ Impossible de récupérer les données météo")
+    
+    # Forces G si activé
+    if show_g_forces:
+        st.markdown("---")
+        st.markdown("### 🎢 Forces G (Accélération)")
+        gcol1, gcol2, gcol3 = st.columns(3)
+        with gcol1:
+            st.metric("G Max", f"{df['g_force_total'].max():.2f} G")
+        with gcol2:
+            st.metric("G Moyen", f"{df[df['state']=='Ski']['g_force_total'].mean():.2f} G")
+        with gcol3:
+            max_g_idx = df['g_force_total'].idxmax()
+            max_g_speed = df.loc[max_g_idx, 'speed_kmh']
+            st.metric("Vitesse au G Max", f"{max_g_speed:.1f} km/h")
+        
+        fig_g = px.line(
+            df[df['state'] == 'Ski'],
+            x='time',
+            y='g_force_total',
+            title='Forces G au fil du temps',
+            labels={'time': 'Heure', 'g_force_total': 'Force G'},
+            template='plotly_white'
+        )
+        fig_g.add_hline(y=1, line_dash="dash", line_color="green", 
+                       annotation_text="1G (gravité normale)")
+        fig_g.update_traces(line_color='#FF6B6B', line_width=2)
+        st.plotly_chart(fig_g, use_container_width=True)
     
     st.markdown("---")
     
@@ -831,37 +1099,81 @@ file_content = uploaded_file.read()
         if fatigue_chart:
             st.plotly_chart(fatigue_chart, use_container_width=True)
     
-    # Sauts si activé
-    if show_jumps and not df.empty:
-        jumps_df = detect_jumps(df[df['state'] == 'Ski'])
+    # Comparaison et Heatmap
+    if len(runs_df) > 1:
+        st.plotly_chart(create_run_comparison(runs_df), use_container_width=True)
+    
+    heatmap = create_performance_heatmap(runs_df)
+    if heatmap:
+        st.plotly_chart(heatmap, use_container_width=True)
+    
+    # Timeline
+    st.plotly_chart(create_timeline(runs_df, df), use_container_width=True)
+    
+    # Sauts détectés
+    jumps_df = detect_jumps(df[df['state'] == 'Ski'])
+    
+    if show_jumps:
+        st.markdown("---")
         if not jumps_df.empty:
             st.markdown("### 🪂 Sauts Détectés")
             jump_col1, jump_col2 = st.columns([1, 2])
             with jump_col1:
-                st.metric("Nombre de sauts", len(jumps_df))
-                st.metric("Temps en l'air total", f"{jumps_df['air_time'].sum():.1f} s")
+                st.metric("🪂 Nombre de sauts", len(jumps_df))
+                st.metric("⏱️ Temps total en l'air", f"{jumps_df['air_time'].sum():.1f} s")
+                if len(jumps_df) > 0:
+                    st.metric("🏔️ Plus haut saut", f"{jumps_df['height_estimate'].max():.1f} m")
             with jump_col2:
+                jumps_display = jumps_df.copy()
+                jumps_display['time'] = jumps_display['time'].dt.strftime('%H:%M:%S')
                 st.dataframe(
-                    jumps_df.style.format({
+                    jumps_display.style.format({
                         'air_time': '{:.2f} s',
                         'height_estimate': '{:.1f} m'
                     }),
-                    use_container_width=True
+                    use_container_width=True,
+                    hide_index=True
                 )
+        else:
+            st.info("🪂 Aucun saut détecté dans cette session")
+    
+    # Virages serrés
+    if show_turns:
+        st.markdown("---")
+        turns_df = detect_sharp_turns(df)
+        if not turns_df.empty:
+            st.markdown("### 🔄 Virages Serrés Détectés")
+            turn_col1, turn_col2 = st.columns([1, 2])
+            with turn_col1:
+                st.metric("Nombre de virages", len(turns_df))
+                st.metric("Virage le plus serré", f"{turns_df['angle'].max():.0f}°")
+            with turn_col2:
+                turns_display = turns_df.copy()
+                turns_display['time'] = turns_display['time'].dt.strftime('%H:%M:%S')
+                st.dataframe(
+                    turns_display[['time', 'angle', 'speed']].style.format({
+                        'angle': '{:.0f}°',
+                        'speed': '{:.1f} km/h'
+                    }),
+                    use_container_width=True,
+                    hide_index=True
+                )
+        else:
+            st.info("🔄 Aucun virage serré détecté")
     
     # --- SECTION 3 : TABLEAU DES DESCENTES ---
     st.markdown("### 🎿 Détail des Descentes")
     
     if not runs_df.empty:
-        col_osm, col_export, col_save = st.columns([2, 1, 1])
+        col_osm, col_csv, col_json, col_gpx, col_save = st.columns(5)
         
         with col_osm:
             identify_names = st.checkbox(
-                "🔍 Identifier les pistes via OpenStreetMap",
-                help="Interroge OSM (peut prendre du temps)"
+                "🔍 OSM",
+                help="Identifier les pistes"
             )
         
-        with col_export:
+        with col_csv:
             csv_data = export_to_csv(runs_df)
             st.download_button(
                 label="📥 CSV",
@@ -870,7 +1182,7 @@ file_content = uploaded_file.read()
                 mime="text/csv"
             )
         
-        with col_save:
+        with col_json:
             json_data = export_session_json(runs_df, df, score)
             st.download_button(
                 label="💾 JSON",
@@ -879,31 +1191,47 @@ file_content = uploaded_file.read()
                 mime="application/json"
             )
         
-        # Sauvegarder la session
-        if st.button("💾 Sauvegarder cette session dans l'historique"):
-            st.session_state.sessions.append({
-                'date': df['time'].iloc[0],
-                'runs': len(runs_df),
-                'denivele': df['cumulative_descent'].max(),
-                'vitesse_max': df['speed_kmh'].max(),
-                'score': score
-            })
-            st.success("✅ Session sauvegardée !")
-            st.rerun()
+        with col_gpx:
+            gpx_ski_only = export_filtered_gpx(df, 'Ski')
+            st.download_button(
+                label="📍 GPX",
+                data=gpx_ski_only,
+                file_name=f"ski_only_{datetime.now().strftime('%Y%m%d')}.gpx",
+                mime="application/gpx+xml"
+            )
         
-        # Identification OSM
+        with col_save:
+            if st.button("💾 Sauvegarder"):
+                st.session_state.sessions.append({
+                    'date': df['time'].iloc[0],
+                    'runs': len(runs_df),
+                    'denivele': df['cumulative_descent'].max(),
+                    'vitesse_max': df['speed_kmh'].max(),
+                    'score': score
+                })
+                st.success("✅ Sauvegardé !")
+                st.rerun()
+        
+        # Identification OSM avec cache
         if identify_names:
-            with st.spinner("🌍 Interrogation d'OpenStreetMap..."):
-                progress_bar = st.progress(0)
-                names = []
-                
-                for i, row in runs_df.iterrows():
-                    name = fetch_osm_piste_name(row['lat_center'], row['lon_center'])
-                    names.append(name)
-                    progress_bar.progress((i + 1) / len(runs_df))
-                
-                runs_df['Nom Piste (OSM)'] = names
-                st.success("✅ Identification terminée !")
+            session_key = f"{uploaded_file.name}_{len(runs_df)}_{df['time'].iloc[0].isoformat()}"
+            
+            if session_key not in st.session_state.piste_names:
+                with st.spinner("🌍 Interrogation d'OpenStreetMap..."):
+                    progress_bar = st.progress(0)
+                    names = []
+                    
+                    for i, row in runs_df.iterrows():
+                        name = fetch_osm_piste_name(row['lat_center'], row['lon_center'])
+                        names.append(name)
+                        progress_bar.progress((i + 1) / len(runs_df))
+                    
+                    st.session_state.piste_names[session_key] = names
+                    st.success("✅ Identification terminée et mise en cache !")
+            else:
+                st.info("ℹ️ Noms de pistes chargés depuis le cache")
+            
+            runs_df['Nom Piste (OSM)'] = st.session_state.piste_names[session_key]
         else:
             runs_df['Nom Piste (OSM)'] = "Non recherché"
         
@@ -919,7 +1247,7 @@ file_content = uploaded_file.read()
         display_cols = [
             'N°', 'Début', 'Nom Piste (OSM)', 'Couleur Dominante',
             'Dénivelé (m)', 'Distance (m)', 'Durée', 
-            'Vitesse Max (km/h)', 'Pente Max (%)'
+            'Vitesse Max (km/h)', 'Pente Max (%)', 'G Max'
         ]
         
         styled_df = runs_df[display_cols].style.applymap(
@@ -957,7 +1285,7 @@ file_content = uploaded_file.read()
             rest_df = detect_rest_zones(df)
             if not rest_df.empty:
                 st.markdown("**🛑 Zones de repos**")
-                st.write(f"{len(rest_df)} arrêt(s) détecté(s) (>{10}s)")
+                st.write(f"{len(rest_df)} arrêt(s) détecté(s) (>10s)")
     
     # Recommandations
     st.markdown("### 💡 Recommandations Personnalisées")
@@ -1006,6 +1334,8 @@ file_content = uploaded_file.read()
                 - 📊 Vitesse moy : {run_data['Vitesse Moy (km/h)']} km/h
                 - 📐 Pente max : {run_data['Pente Max (%)']} %
                 - 📐 Pente moy : {run_data['Pente Moy (%)']} %
+                - 🎢 G Max : {run_data['G Max']} G
+                - 🎢 G Moyen : {run_data['G Moyen']} G
                 """)
             
             run_points = run_data['points']
@@ -1039,47 +1369,3 @@ except Exception as e:
     - Contient-il des données de traces GPS ?
     - Essayez de réexporter depuis votre application
     """)
-else:
-st.info(”””
-### 🎯 Comment utiliser cette application ?
-1. **Exportez** vos traces depuis votre app de ski (Slopes, Ski Tracks, etc.) en GPX
-2. **Importez** le fichier via le bouton ci-dessus
-3. **Analysez** automatiquement :
-   - Difficulté des pistes (Verte/Bleue/Rouge/Noire)
-   - Vitesses, dénivelés et statistiques
-   - Identification des pistes via OpenStreetMap
-   - Détection de sauts et zones de repos
-   - Score de session et recommandations
-   - Visualisation 3D interactive
-
-### ✨ Nouvelles Fonctionnalités
-- 🪂 **Détection de sauts** avec estimation de hauteur
-- 📊 **Analyse de fatigue** sur les descentes
-- 🏆 **Score de session** personnalisé
-- 💡 **Recommandations** basées sur vos performances
-- 📚 **Historique** de vos sessions
-- 🌡️ **Données météo** en temps réel
-- 🎨 **Thèmes** personnalisables
-- 🗺️ **Heatmap** de vitesse sur carte 3D
-""")
-
-st.markdown("### 📊 Exemple de résultat")
-
-example_data = pd.DataFrame({
-    'N°': [1, 2, 3],
-    'Piste': ['Les Crêtes', 'Bellecôte', 'Face Nord'],
-    'Couleur': ['Rouge', 'Bleue', 'Noire'],
-    'Dénivelé': [450, 320, 580],
-    'Vitesse Max': [78, 62, 85],
-    'Durée': ['5:23', '4:12', '6:45']
-})
-
-st.dataframe(example_data, use_container_width=True)
-Footer
-st.markdown(”—”)
-st.markdown(”””
-<div style='text-align: center; color: #666;'>
-    <p>Ski Analytics Pro v3.0 - Édition Complète | Streamlit × OpenStreetMap × Open-Meteo</p>
-    <p>🏔️ Analysez, Comparez, Progressez, Dépassez-vous ! 🏔️</p>
-</div>
-""", unsafe_allow_html=True)
