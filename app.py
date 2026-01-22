@@ -9,6 +9,8 @@ from haversine import haversine, Unit
 import math
 import requests
 
+
+
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Ski Analytics V2 - AI Edition", layout="wide", page_icon="🏔️")
 
@@ -133,14 +135,33 @@ def detect_runs(df):
 # --- INTERFACE ---
 
 st.title("⛷️ Ski Analytics V2 : Reconnaissance IA")
-st.markdown("Analyse automatique de la difficulté des pistes et visualisation 3D.")
+st.markdown("Analyse automatique de la difficulté des pistes et visualisation
 
-uploaded_file = st.file_uploader("📂 Importez votre GPX", type=['gpx'])
+uploaded_file = st.file_uploader("📂 Importez votre fichier (GPX, TXT, XML...)", type=None)
 
-if uploaded_file:
-    with st.spinner("Analyse topographique en cours..."):
-        df = parse_and_enrich_gpx(uploaded_file)
-        runs_df = detect_runs(df)
+if uploaded_file is not None:
+    try:
+        # On lit le contenu du fichier
+        file_content = uploaded_file.read().decode("utf-8")
+        
+        # On tente de parser le contenu même si l'extension est bizarre
+        try:
+            gpx = gpxpy.parse(file_content)
+            
+            if not gpx.tracks:
+                st.error("Le fichier a été lu, mais il ne semble pas contenir de traces GPS valides.")
+            else:
+                st.success(f"✅ Fichier '{uploaded_file.name}' chargé avec succès !")
+                # Appelez ici votre fonction de traitement habituelle :
+                # df = parse_and_enrich_gpx_from_string(file_content)
+                # ...
+                
+        except Exception as e:
+            st.error("Erreur de lecture : Ce fichier n'est pas au format GPX (même s'il est débloqué).")
+            st.info("Astuce : Assurez-vous d'avoir bien exporté depuis Slopes en format 'GPX'.")
+
+    except Exception as e:
+        st.error(f"Impossible de lire ce fichier : {e}")
         
         # --- SECTION 1 : STATS GLOBALES ---
         col1, col2, col3, col4 = st.columns(4)
