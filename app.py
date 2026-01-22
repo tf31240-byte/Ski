@@ -135,7 +135,7 @@ def detect_runs(df):
 # --- INTERFACE ---
 
 st.title("⛷️ Ski Analytics V2 : Reconnaissance IA")
-st.markdown("Analyse automatique de la difficulté des pistes et visualisation
+st.markdown("Analyse automatique de la difficulté des pistes et visualisation")
 
 uploaded_file = st.file_uploader("📂 Importez votre fichier (GPX, TXT, XML...)", type=None)
 
