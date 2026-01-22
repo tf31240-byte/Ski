@@ -739,4 +739,59 @@ if uploaded_file is not None:
                 st.plotly_chart(fig_run, use_container_width=True)
     
     except Exception as e:
-        st.error(f"❌ Erreur lors​​​​​​​​​​​​​​​​
+        st.error(f"❌ Erreur lors de l'analyse du fichier")
+        st.exception(e)
+        st.info("""
+        **Vérifications :**
+        - Le fichier est-il bien au format GPX ?
+        - Contient-il des données de traces GPS ?
+        - Essayez de réexporter depuis votre application
+        """)
+
+else:
+    # Page d'accueil
+    st.info("""
+    ### 🎯 Comment utiliser cette application ?
+    
+    1. **Exportez** vos traces depuis votre application de ski (Slopes, Ski Tracks, etc.) au format GPX
+    2. **Importez** le fichier via le bouton ci-dessus
+    3. **Analysez** automatiquement :
+       - Difficulté des pistes (Verte/Bleue/Rouge/Noire)
+       - Vitesses et dénivelés
+       - Identification des pistes via OpenStreetMap
+       - Visualisation 3D interactive
+    
+    ### 📋 Fonctionnalités
+    - ✅ Détection automatique de difficulté basée sur la pente
+    - ✅ Reconnaissance des pistes via OpenStreetMap
+    - ✅ Statistiques détaillées par descente
+    - ✅ Graphiques interactifs
+    - ✅ Carte 3D avec relief
+    - ✅ Export CSV des résultats
+    """)
+    
+    # Exemple de données
+    st.markdown("### 📊 Exemple de résultat")
+    
+    example_data = pd.DataFrame({
+        'N°': [1, 2, 3],
+        'Piste': ['Les Crêtes', 'Bellecôte', 'Face Nord'],
+        'Couleur': ['Rouge', 'Bleue', 'Noire'],
+        'Dénivelé': [450, 320, 580],
+        'Vitesse Max': [78, 62, 85],
+        'Durée': ['5:23', '4:12', '6:45']
+    })
+    
+    st.dataframe(example_data, use_container_width=True)
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #666;'>
+    <p>Ski Analytics Pro v2.0 | Propulsé par Streamlit & OpenStreetMap</p>
+    <p>🏔️ Analysez, Comparez, Progressez ! 🏔️</p>
+</div>
+""", unsafe_allow_html=True)
+
+        
+        
