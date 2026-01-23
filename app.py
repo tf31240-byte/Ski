@@ -742,44 +742,45 @@ def create_timeline(runs_df, df):
     # Descentes
     for _, run in runs_df.iterrows():
         fig.add_trace(go.Scatter(
-            x=[run['Début'], run​​​​​​​​​​​​​​​​
-[‘Fin’]],
-y=[run[‘N°’], run[‘N°’]],
-mode=‘lines+markers’,
-name=f”Descente {run[‘N°’]}”,
-line=dict(width=8),
-marker=dict(size=12),
-hovertemplate=f”<b>Descente {run[‘N°’]}</b><br>” +
-f”Couleur: {run[‘Couleur Dominante’]}<br>” +
-f”Vitesse max: {run[‘Vitesse Max (km/h)’]} km/h<br>” +
-f”Dénivelé: {run[‘Dénivelé (m)’]} m<br>” +
-“<extra></extra>”
-))
-# Remontées
-lifts = df[df['state'] == 'Remontée'].copy()
-if not lifts.empty:
-    lifts['lift_group'] = (lifts['state'] != lifts['state'].shift()).cumsum()
-    for _, group in lifts.groupby('lift_group'):
-        if len(group) > 1:
-            fig.add_trace(go.Scatter(
-                x=[group['time'].iloc[0], group['time'].iloc[-1]],
-                y=[0, 0],
-                mode='lines',
-                name='Remontée',
-                line=dict(width=3, dash='dash', color='gray'),
-                showlegend=False
-            ))
+            x=[run['Début'], run['Fin']],
+            y=[run['N°'], run['N°']],
+            mode='lines+markers',
+            name=f"Descente {run['N°']}",
+            line=dict(width=8),
+            marker=dict(size=12),
+            hovertemplate=f"<b>Descente {run['N°']}</b><br>" +
+                         f"Couleur: {run['Couleur Dominante']}<br>" +
+                         f"Vitesse max: {run['Vitesse Max (km/h)']} km/h<br>" +
+                         f"Dénivelé: {run['Dénivelé (m)']} m<br>" +
+                         "<extra></extra>"
+        ))
+    
+    # Remontées
+    lifts = df[df['state'] == 'Remontée'].copy()
+    if not lifts.empty:
+        lifts['lift_group'] = (lifts['state'] != lifts['state'].shift()).cumsum()
+        for _, group in lifts.groupby('lift_group'):
+            if len(group) > 1:
+                fig.add_trace(go.Scatter(
+                    x=[group['time'].iloc[0], group['time'].iloc[-1]],
+                    y=[0, 0],
+                    mode='lines',
+                    name='Remontée',
+                    line=dict(width=3, dash='dash', color='gray'),
+                    showlegend=False
+                ))
+    
+    fig.update_layout(
+        title='Timeline de la Journée',
+        xaxis_title='Heure',
+        yaxis_title='Descente N°',
+        height=400,
+        template='plotly_white',
+        hovermode='closest'
+    )
+    
+    return fig
 
-fig.update_layout(
-    title='Timeline de la Journée',
-    xaxis_title='Heure',
-    yaxis_title='Descente N°',
-    height=400,
-    template='plotly_white',
-    hovermode='closest'
-)
-
-return fig
 def create_3d_map(df):
 “”“Crée une carte 3D interactive avec PyDeck”””
 ski_data = df[df[‘state’] == ‘Ski’].copy()
