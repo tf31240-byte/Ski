@@ -1412,4 +1412,4 @@ st.markdown(”””
     <p>Ski Analytics Pro v3.5 - Édition Complète | Streamlit × OpenStreetMap × Open-Meteo</p>
     <p>🏔️ Analysez, Comparez, Progressez, Dépassez-vous ! 🏔️</p>
 </div>
-""", unsafe_allow_html=True)
+""", unsafe_allow_html=True)```
