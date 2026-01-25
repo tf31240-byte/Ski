@@ -87,14 +87,29 @@ def parse_metadata(zip_file: zipfile.ZipFile) -> Tuple[Optional[Activity], List[
     try:
         xml_files = [f for f in zip_file.namelist() if 'metadata' in f.lower()]
         if not xml_files:
+            st.warning("⚠️ Fichier XML metadata introuvable")
             return None, []
+        
+        st.info(f"📄 Lecture de {xml_files[0]}")
         
         with zip_file.open(xml_files[0]) as f:
             tree = ET.parse(f)
             root = tree.getroot()
             
-            # Activity globale
-            act_elem = root.find('.//Activity')
+            # Affichage debug de la structure
+            st.text(f"Root tag: {root.tag}")
+            st.text(f"Root attribs: {list(root.attrib.keys())[:5]}")
+            
+            # Activity globale - le root EST déjà l'Activity
+            act_elem = root if root.tag == 'Activity' else root.find('.//Activity')
+            
+            if act_elem is None:
+                st.error("❌ Élément <Activity> introuvable dans le XML")
+                st.text("Structure XML:")
+                for child in root:
+                    st.text(f"  - {child.tag}")
+                return None, []
+            
             activity = Activity(
                 location=act_elem.get('locationName', 'Unknown'),
                 start=date_parser.parse(act_elem.get('start')).astimezone(timezone.utc),
@@ -109,28 +124,44 @@ def parse_metadata(zip_file: zipfile.ZipFile) -> Tuple[Optional[Activity], List[
             
             # Actions (Runs + Lifts)
             actions = []
-            for elem in root.findall('.//Action'):
-                action_type = ActionType.RUN if elem.get('type') == 'Run' else ActionType.LIFT
-                
-                actions.append(Action(
-                    type=action_type,
-                    number=int(elem.get('numberOfType', 0)),
-                    start=date_parser.parse(elem.get('start')).astimezone(timezone.utc),
-                    end=date_parser.parse(elem.get('end')).astimezone(timezone.utc),
-                    duration=float(elem.get('duration', 0)),
-                    distance=float(elem.get('distance', 0)),
-                    vertical=float(elem.get('vertical', 0)),
-                    max_alt=float(elem.get('maxAlt', 0)),
-                    min_alt=float(elem.get('minAlt', 0)),
-                    avg_speed=float(elem.get('avgSpeed', 0)),
-                    top_speed=float(elem.get('topSpeed', 0))
-                ))
+            actions_elem = root.find('.//actions')
             
-            st.success(f"✅ {len(actions)} actions chargées ({activity.run_count} runs)")
+            if actions_elem is None:
+                st.warning("⚠️ Élément <actions> introuvable, recherche directe des <Action>")
+                action_elems = root.findall('.//Action')
+            else:
+                action_elems = actions_elem.findall('Action')
+            
+            st.info(f"🔍 {len(action_elems)} actions détectées")
+            
+            for elem in action_elems:
+                try:
+                    action_type = ActionType.RUN if elem.get('type') == 'Run' else ActionType.LIFT
+                    
+                    actions.append(Action(
+                        type=action_type,
+                        number=int(elem.get('numberOfType', 0)),
+                        start=date_parser.parse(elem.get('start')).astimezone(timezone.utc),
+                        end=date_parser.parse(elem.get('end')).astimezone(timezone.utc),
+                        duration=float(elem.get('duration', 0)),
+                        distance=float(elem.get('distance', 0)),
+                        vertical=float(elem.get('vertical', 0)),
+                        max_alt=float(elem.get('maxAlt', 0)),
+                        min_alt=float(elem.get('minAlt', 0)),
+                        avg_speed=float(elem.get('avgSpeed', 0)),
+                        top_speed=float(elem.get('topSpeed', 0))
+                    ))
+                except Exception as e:
+                    st.warning(f"⚠️ Action ignorée: {e}")
+                    continue
+            
+            st.success(f"✅ {len(actions)} actions chargées ({activity.run_count} runs attendus)")
             return activity, actions
             
     except Exception as e:
-        st.error(f"Erreur XML: {e}")
+        st.error(f"❌ Erreur XML: {e}")
+        import traceback
+        st.code(traceback.format_exc())
         return None, []
 
 def load_gps(zip_file: zipfile.ZipFile) -> Optional[pd.DataFrame]:
