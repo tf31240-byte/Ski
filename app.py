@@ -364,6 +364,9 @@ class Session:
 # ============================================================================
 # VISUALIZATION FUNCTIONS
 # ============================================================================
+# ============================================================================
+# CORRECTION VISUALISATIONS PYDECK
+# ============================================================================
 
 def create_replay_map(session: Session, selected_run_idx: int, time_idx: int):
     """Crée la carte 3D pour le mode Replay."""
@@ -372,47 +375,62 @@ def create_replay_map(session: Session, selected_run_idx: int, time_idx: int):
     
     if df is None or df.empty: return None
 
-    # 1. Tracé complet de la piste (semi-transparent)
+    # 1. Tracé complet de la piste
+    # IMPORTANT: On filtre pour ne garder que lat/lon pour éviter l'erreur de sérialisation
+    # des timestamps ou autres colonnes complexes.
+    path_data = df[['lon', 'lat']].copy()
+    
     path_layer = pdk.Layer(
         "PathLayer",
-        data=df,
-        get_path="[['lon', 'lat']]",
-        get_color=[255, 255, 255, 100], # Blanc transparent
+        data=path_data,
+        get_path="[['lon', 'lat']]", # Note: On utilise les noms de colonnes
+        get_color=[255, 255, 255, 100],
         width_min_pixels=6,
         pickable=False
     )
     
     # 2. Position actuelle (Le "Skieur")
+    # On extrait la ligne et on la convertit explicitement en DataFrame (1 ligne)
+    # On ajoute 'bearing' pour l'orientation de la caméra
     current_pos = df.iloc[time_idx]
+    skier_data = pd.DataFrame([{
+        "lon": current_pos['lon'],
+        "lat": current_pos['lat'],
+        "bearing": current_pos['bearing']
+    }])
     
     skier_layer = pdk.Layer(
         "ScatterplotLayer",
-        data=[current_pos],
+        data=skier_data, # On passe un DataFrame propre
         get_position=["lon", "lat"],
-        get_color=[255, 0, 0], # Rouge
+        get_color=[255, 0, 0],
         get_radius=10,
         pickable=False
     )
     
     # 3. Vue subjective (FPV)
     # On centre la caméra sur la position actuelle
-    # On oriente la caméra selon le bearing GPS
     view_state = pdk.ViewState(
         latitude=current_pos['lat'],
         longitude=current_pos['lon'],
-        zoom=16,         # Zoom serré pour effet POV
-        pitch=60,         # Inclinaison (0=carto, 90=verticale)
-        bearing=current_pos['bearing'] # La caméra tourne avec le skieur
+        zoom=16,
+        pitch=60,
+        bearing=current_pos['bearing']
     )
     
     return pdk.Deck(layers=[path_layer, skier_layer], initial_view_state=view_state, map_style="mapbox://styles/mapbox/outdoors-v11")
 
 def create_heatmap(session: Session, mode: str):
     """Crée une carte thermique (Density, Speed, G-Force)."""
-    df = session.get_all_gps()
+    full_df = session.get_all_gps()
+    
+    if full_df is None or full_df.empty: return None
+    
+    # Filtrage des données pour ne garder que ce dont PyDeck a besoin
+    # Cela résout les erreurs de sérialisation
+    df = full_df[['lon', 'lat']].copy()
     
     if mode == "Density":
-        # Heatmap classique (densité des points)
         layer = pdk.Layer(
             "HeatmapLayer",
             data=df,
@@ -421,8 +439,8 @@ def create_heatmap(session: Session, mode: str):
             opacity=0.8
         )
     elif mode == "Speed":
-        # Scatterplot coloré par vitesse
-        # Vitesse lente = Bleu, Vite = Rouge
+        # Ajout de la colonne vitesse pour le mapping couleur
+        df['speed_kmh'] = full_df['speed_kmh'].values
         layer = pdk.Layer(
             "ScatterplotLayer",
             data=df,
@@ -432,12 +450,13 @@ def create_heatmap(session: Session, mode: str):
             pickable=True
         )
     elif mode == "G-Lat":
-        # Scatterplot coloré par G Latéral (Virages techniques)
+        # Ajout de la colonne G-Lat
+        df['g_lat'] = full_df['g_lat'].values
         layer = pdk.Layer(
             "ScatterplotLayer",
             data=df,
             get_position=["lon", "lat"],
-            get_color="[255 * (g_lat/2), 255 * (1 - g_lat/2), 0, 150]", # Vert à Rouge
+            get_color="[255 * (g_lat/2), 255 * (1 - g_lat/2), 0, 150]",
             get_radius=20
         )
     
