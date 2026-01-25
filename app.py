@@ -119,7 +119,7 @@ def parse_slope_metadata(zip_file):
     except Exception as e:
         return None
 
-def load_slope_file(uploaded_file):
+def load_slopes_file(uploaded_file):
     """Charge le fichier .slope (ZIP) et extrait le CSV GPS + le XML Metadata."""
     try:
         with zipfile.ZipFile(uploaded_file, 'r') as z:
