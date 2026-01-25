@@ -13,8 +13,8 @@ from dateutil import parser as date_parser
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="Ski Analytics Pro - Filtre Altitude Edition", 
-    layout="wide", 
+    page_title="Ski Analytics Pro - Metadata Edition", 
+    layout="wideset", 
     page_icon="🏔️",
     initial_sidebar_state="expanded"
 )
@@ -38,7 +38,7 @@ DIFFICULTY_THRESHOLDS = {
 # --- UTILITIES ---
 
 def calculate_distance_vectorized(df):
-    """Calcul vectorisé de la distance Haversine (en mètres)."""
+    """Calcul vectorisé de la distance Haversine."""
     lat1, lon1 = np.radians(df['lat'].values), np.radians(df['lon'].values)
     lat2, lon2 = np.radians(df['lat'].shift(-1).values), np.radians(df['lon'].shift(-1).values)
     
@@ -89,7 +89,7 @@ def get_weather_cached(lat, lon):
 # --- PARSERS (ROBUSTE) ---
 
 def parse_slope_metadata(zip_file):
-    """Extrait les actions Lift/Run du XML et retourne une dict d'infos brutes."""
+    """Extrait les actions Lift/Run du XML et retourne une dict d'infos complètes."""
     try:
         st.info("📂 1/3 : Extraction des métadonnées (XML)...")
         metadata_files = [f for f in zip_file.namelist() if 'metadata' in f.lower()]
@@ -105,11 +105,14 @@ def parse_slope_metadata(zip_file):
             
             actions = []
             for action in root.findall('.//Action'):
-                action_type = action.get('type') 
+                action_type = action.get('type')
                 start_str = action.get('start')
                 end_str = action.get('end')
                 max_alt = action.get('maxAlt')
                 min_alt = action.get('minAlt')
+                distance = action.get('distance')
+                duration = action.get('duration')
+                top_speed = action.get('topSpeed')
                 
                 if start_str and end_str:
                     try:
@@ -124,12 +127,15 @@ def parse_slope_metadata(zip_file):
                             'end': end_utc,
                             'id': action.get('numberOfType'),
                             'max_alt': float(max_alt) if max_alt else None,
-                            'min_alt': float(min_alt) if min_alt else None
+                            'min_alt': float(min_alt) if min_alt else None,
+                            'distance': float(distance) if distance else None,
+                            'duration': float(duration) if duration else None,
+                            'top_speed': float(top_speed) if top_speed else None
                         })
                     except Exception:
                         continue
             if actions:
-                st.success(f"✅ {len(actions)} actions détectés.")
+                st.success(f"✅ {len(actions)} segments (Lifts/Runs) détectés.")
             else:
                 st.warning("⚠️ Aucun segment 'Action' trouvé dans le XML.")
             return actions
@@ -138,7 +144,7 @@ def parse_slope_metadata(zip_file):
         return None
 
 def identify_gps_columns(df_raw):
-    """Détecte intelligemment les colonnes Time, Lat, Lon, Alt (Europe)."""
+    """Détecte intelligemment les colonnes Time, Lat, Lon, Alt."""
     st.text("🔍 Analyse de la structure du CSV en cours...")
     
     if df_raw.empty:
@@ -193,7 +199,6 @@ def identify_gps_columns(df_raw):
         return [mapping['time'], mapping['lat'], mapping['lon'], mapping['ele']]
     else:
         st.error("Échec de l'identification automatique.")
-        st.write(mapping)
         return None
 
 def load_slope_file(uploaded_file):
@@ -227,7 +232,6 @@ def load_slope_file(uploaded_file):
             st.text(f"Fichier trouvé : {target_csv}")
 
             with z.open(target_csv) as f:
-                # Regex pour accepter Pipe, Virgule OU Tabulation
                 df_raw = pd.read_csv(f, sep=r'[|,\t]', engine='python', header=None, on_bad_lines='skip')
                 
                 if df_raw.empty:
@@ -251,7 +255,6 @@ def load_slope_file(uploaded_file):
                 df_raw = df_raw.iloc[:, [idx_time, idx_lat, idx_lon, idx_ele]].copy()
                 df_raw.columns = ['time', 'lat', 'lon', 'ele']
 
-                # Conversion Types
                 df_raw['time'] = pd.to_numeric(df_raw['time'], errors='coerce')
                 df_raw['lat'] = pd.to_numeric(df_raw['lat'], errors='coerce')
                 df_raw['lon'] = pd.to_numeric(df_raw['lon'], errors='coerce')
@@ -275,11 +278,10 @@ def load_slope_file(uploaded_file):
 # --- CORE LOGIC ---
 
 class SkiRun:
-    def __init__(self, run_id, df_segment):
+    def __init__(self, run_id, df_segment, metadata_data=None):
         self.id = run_id
+        self.metadata = metadata_data
         self.df = df_segment.copy()
-        self.metadata = None 
-        
         if not self.df.empty:
             self.start_time = self.df['time'].iloc[0]
             self.end_time = self.df['time'].iloc[-1]
@@ -292,18 +294,35 @@ class SkiRun:
         if self.df.empty:
             return
             
-        self.duration_sec = (self.end_time - self.start_time).total_seconds()
-        self.distance_m = self.df['dist'].sum()
+        # --- PRIORITÉ MÉTADATA ---
         
-        # Utiliser altitude XML si dispo, sinon GPS
-        if self.metadata and self.metadata['min_alt'] is not None and self.metadata['max_alt'] is not None:
+        # 1. Durée
+        if self.metadata and self.metadata['duration']:
+            self.duration_sec = self.metadata['duration']
+        else:
+            self.duration_sec = (self.end_time - self.start_time).total_seconds()
+
+        # 2. Distance
+        if self.metadata and self.metadata['distance']:
+            self.distance_m = self.metadata['distance']
+        else:
+            self.distance_m = self.df['dist'].sum()
+        
+        # 3. Altitude
+        if self.metadata and self.metadata['max_alt'] and self.metadata['min_alt']:
             self.drop_m = self.metadata['max_alt'] - self.metadata['min_alt']
         else:
             self.drop_m = self.df['ele'].max() - self.df['ele'].min()
             
-        self.max_speed = self.df['speed_kmh'].max()
+        # 4. Vitesse Max
+        if self.metadata and self.metadata['top_speed']:
+            self.max_speed = self.max(self.df['speed_kmh'].max(), self.metadata['top_speed'])
+        else:
+            self.max_speed = self.df['speed_kmh'].max()
+        
         self.avg_speed = self.df['speed_kmh'].mean()
         
+        # Métriques GPS (G, Rugosité, Carving) restent inchangées car pas dans XML
         self.max_g_lat = self.df['g_lat'].max()
         self.max_g_long = self.df['g_long'].max()
         self.avg_rugosity = self.df['roughness'].mean()
@@ -324,14 +343,30 @@ class SkiRun:
             self.avg_turn_angle = 0
 
     def get_metrics(self):
-        display_alt = int(self.metadata['max_alt']) if self.metadata and self.metadata['max_alt'] else (int(self.df['ele'].max()) if not self.df.empty else 0)
+        # Altitude : XML优先 (fichier metadata ou fallback)
+        if self.metadata and self.metadata['max_alt']:
+            display_alt = self.metadata['max_alt']
+        else:
+            display_alt = self.df['ele_smooth'].max()
         
+        # Distance : XML优先
+        if self.metadata and self.metadata['distance']:
+            display_dist = self.metadata['distance']
+        else:
+            display_dist = int(self.distance_m)
+
+        # Vitesse Max
+        display_speed = f"{int(self.max_speed)} km/h"
+        if self.metadata and self.metadata['top_speed']:
+            display_speed += " (XML)"
+
         return {
             "N°": self.id,
             "Durée": f"{int(self.duration_sec//60)}:{int(self.duration_sec%60):02d}",
-            "Distance": f"{int(self.distance_m)} m",
+            "Distance": f"{display_dist} m",
             "Dénivelé": f"{int(self.drop_m)} m",
-            "Vitesse Max": f"{int(self.max_speed)} km/h",
+            "Alt Max (m)": f"{int(display_alt)} m",
+            "Vitesse Max": display_speed,
             "Vitesse Moy": f"{self.avg_speed:.1f} km/h",
             "G Lat Max": f"{self.max_g_lat:.2f} G",
             "Rugosité Max": f"{self.max_rugosity:.2f}",
@@ -390,6 +425,7 @@ class SkiSession:
         
         df['centripetal_accel'] = (df['speed_ms']**2) / df['radius']
         df['g_lat'] = (df['centripetal_accel'] / 9.81)
+        df['g_lat'] = (df['centripetal_accel'] / 9.81)
         df['g_lat'] = df['g_lat'].clip(0, 5)
 
         # 6. RUGOSITÉ
@@ -411,7 +447,7 @@ class SkiSession:
                     elif action_type == 'run':
                         df.loc[mask_seg, 'state'] = 'Ski'
         else:
-            # Fallback Heuristique
+            # Fallback
             is_lift = (df['speed_kmh'] < 25) & (df['speed_kmh'] > 2) & (df['grade_raw'] > 0.5)
             df.loc[is_lift, 'state'] = 'Remontee'
             is_ski = (df['speed_kmh'] > 5) & (df['grade_raw'] < -0.5)
@@ -421,11 +457,10 @@ class SkiSession:
         self._detect_runs()
 
     def _detect_runs(self):
-        # CORRECTION : On définit df explicitement ici pour éviter NameError
-        df = self.df
-        if df is None: return # Sécurité
-        
         min_drop = st.session_state.get('min_drop', 20.0)
+        
+        df = self.df # Correction : On utilise self.df
+        if df is None: return
         
         df['segment'] = (df['state'] != df['state'].shift()).cumsum()
         run_id = 1
@@ -434,12 +469,12 @@ class SkiSession:
                 continue
             
             duration = group['dt'].sum()
-            # Utilisation altitude brute pour calcul drop plus fiable sur petits tronçons
+            # On utilise l'altitude brute pour calcul du dénivelé (plus fiable que lissée pour petits tronçons)
             drop = group['ele'].max() - group['ele'].min()
             
             if duration < 30 or drop < min_drop: continue
             
-            # Récupération de la métadonnée associée
+            # Récupération de la métadonnée
             run_meta = None
             if self.metadata_actions:
                 for action in self.metadata_actions:
@@ -457,7 +492,7 @@ class SkiSession:
     def get_global_stats(self):
         total_dist = self.df['dist'].sum() / 1000
         df_ski = self.df[self.df['state']=='Ski']
-        total_descent = df_ski['ele_smooth'].max() - df_ski['ele_smooth'].min() if not df_ski.empty else 0
+        total_descent = df_ski['ele'].max() - df_ski['ele'].min() if not df_ski.empty else 0
         ski_time_hours = df_ski['dt'].sum() / 3600
         met = 6.5
         calories = int(met * self.user_weight * ski_time_hours)
@@ -468,7 +503,7 @@ class SkiSession:
             "descent": total_descent,
             "max_speed": self.df['speed_kmh'].max(),
             "max_lat_g": df_ski['g_lat'].max() if not df_ski.empty else 0,
-            "max_alt": self.df['ele_smooth'].max(),
+            "max_alt": self.df['ele'].max(),
             "calories": calories,
             "duration": f"{int(ski_time_hours)}h {int((ski_time_hours%1)*60)}m"
         }
@@ -581,16 +616,8 @@ def main():
         st.subheader("Préférences")
         mapbox_token = st.text_input("Mapbox Token (Optionnel)", type="password")
 
-        # --- AJOUT ---
-        st.subheader("Filtres de détection")
-        min_drop = st.slider("Dénivelé minimum d'une descente (m)", 0.0, 50.0, 20.0, 1.0)
-        min_duration = st.slider("Durée minimum d'une descente (s)", 0.0, 300.0, 30.0, 5.0)
-        st.write("Ajustez ces valeurs pour inclure les traversées plates dans les statistiques.")
-        
         if 'min_drop' not in st.session_state:
             st.session_state['min_drop'] = 20.0
-        if 'min_duration' not in st.session_state:
-            st.session_state['min_duration'] = 30.0
 
     if uploaded_file:
         try:
@@ -603,8 +630,8 @@ def main():
                     st.stop()
 
                 if metadata is None:
-                    st.warning("⚠️ Les métadonnées XML n'ont pas pu être lues. Utilisation du mode Heuristique.")
-
+                    st.warning("⚠️ Les métadonnées XML n'ont pas pu être lues.")
+                
                 session = SkiSession(raw_df, user_weight, metadata_actions=metadata)
                 
             st.success(f"Session analysée : {len(session.runs)} descentes détectées.")
@@ -614,6 +641,7 @@ def main():
             st.sidebar.subheader("⏱️ Replay Temporel")
             min_time = session.df['time'].min().to_pydatetime()
             max_time = session.df['time'].max().to_pydatetime()
+            
             total_duration_sec = (max_time - min_time).total_seconds()
             
             time_range = st.sidebar.slider(
@@ -678,14 +706,12 @@ def main():
                     
                     if run_obj and not run_obj.df.empty:
                         col1, col2 = st.columns(2)
-                        col1.info(f"**Couleur :** {run_obj.color}\n**Carving :** {run_obj.avg_turn_angle:.0f}° moyen.")
-                        col2.metric("Vitesse Max", f"{run_obj.max_speed:.1f} km/h")
+                        col1.info(f"**Couleur :** {run_obj.color}\n**Vitesse Max :** {run_obj.max_speed:.1f} km/h")
                         col2.metric("G Lat Max", f"{run_obj.max_g_lat:.2f} G")
                         fig_detail = px.line(run_obj.df, x='time', y='speed_kmh', title=f"Vitesse Descente #{run_obj.id}")
                         st.plotly_chart(fig_detail, use_container_width=True)
                 else:
-                    st.warning("Aucune donnée de descente à afficher (peut-être à cause de dates incohérentes dans le fichier).")
-
+                    st.warning("Aucune donnée de descente à afficher.")
             with tab3:
                 st.header("Physique & Technique")
                 df_ski_f = df_filtered[df_filtered['state']=='Ski']
@@ -703,7 +729,7 @@ def main():
             st.error("Une erreur critique est survenue.")
             st.exception(e)
     else:
-        st.title("Ski Analytics Pro - Filtre Altitude")
+        st.title("Ski Analytics Pro - Metadata Edition")
         st.info("Veuillez charger un fichier .slopes.")
 
 if __name__ == "__main__":
