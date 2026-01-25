@@ -55,7 +55,6 @@ def smooth_series(series, window_length=21, polyorder=2):
 
 def get_speed_color(speed_kmh):
     """Retourne une couleur RGB pour PyDeck basée sur la vitesse."""
-    # Interpolation simple Vert (10km/h) -> Rouge (60km/h)
     speed = np.clip(speed_kmh, 10, 60)
     ratio = (speed - 10) / 50
     r = int(255 * ratio)
@@ -114,15 +113,83 @@ def parse_slope_metadata(zip_file):
     except Exception as e:
         return None
 
+def identify_gps_columns(df):
+    """
+    Détecte intelligemment les colonnes Time, Lat, Lon, Alt
+    en analysant le contenu des données (valeur heuristique).
+    """
+    # On prend la 2ème ligne (index 1) pour éviter l'index s'il y en a un,
+    # ou les en-têtes si ils ont été mal lus.
+    # On cherche une ligne avec des données numériques valides.
+    sample_row = None
+    
+    # On essaie de trouver une ligne qui ne contient pas de texte (comme "Time" ou "Index")
+    for i in range(min(5, len(df))):
+        row_vals = df.iloc[i].values
+        # Vérifier si au moins 3 valeurs sur 4 sont des nombres valides
+        valid_count = 0
+        for val in row_vals:
+            try:
+                float(val)
+                valid_count += 1
+            except:
+                pass
+        if valid_count >= 3:
+            sample_row = row_vals
+            break
+            
+    if sample_row is None:
+        return None
+
+    mapping = {'time': None, 'lat': None, 'lon': None, 'ele': None}
+    
+    # Heuristiques pour identifier les colonnes
+    for idx, val in enumerate(sample_row):
+        try:
+            num_val = float(val)
+        except:
+            continue
+            
+        if mapping['time'] is None:
+            # Timestamp > 1 milliard (an 2001)
+            if num_val > 1_000_000_000: 
+                mapping['time'] = idx
+                continue
+                
+        if mapping['lat'] is None:
+            # Latitude entre -90 et 90
+            if -90 <= num_val <= 90:
+                mapping['lat'] = idx
+                continue
+        
+        if mapping['lon'] is None:
+            # Longitude entre -180 et 180 (ou simplement > 0 pour Europe)
+            if -180 <= num_val <= 180:
+                mapping['lon'] = idx
+                continue
+        
+        if mapping['ele'] is None:
+            # Altitude plausible (0 à 9000m)
+            if 0 < num_val < 9000:
+                mapping['ele'] = idx
+                continue
+
+    if all(v is not None for v in mapping.values()):
+        return [mapping['time'], mapping['lat'], mapping['lon'], mapping['ele']]
+    else:
+        return None
+
 def load_slope_file(uploaded_file):
-    """Charge le fichier .slopes (ZIP)."""
+    """Charge le fichier .slopes (ZIP) et extrait le CSV GPS + le XML Metadata."""
     try:
         with zipfile.ZipFile(uploaded_file, 'r') as z:
+            # 1. Charger les Métadonnées (XML)
             metadata_segments = parse_slope_metadata(z)
             if not metadata_segments:
-                st.error("Métadonnées XML manquantes.")
+                st.error("Fichier Slope invalide : Métadonnées XML manquantes ou illisibles.")
                 return None, None
 
+            # 2. Charger les données GPS (CSV)
             target_csv = None
             for fname in z.namelist():
                 if 'GPS.csv' in fname and 'Raw' not in fname:
@@ -135,53 +202,50 @@ def load_slope_file(uploaded_file):
                         break
 
             if not target_csv:
-                st.error("Aucun GPS trouvé.")
+                st.error("Aucun fichier GPS (GPS.csv ou RawGPS.csv) trouvé.")
                 return None, None
 
             with z.open(target_csv) as f:
-                first_line = f.readline().decode('utf-8').strip()
-                f.seek(0)
-                parts = [p.strip() for p in first_line.split('|')]
+                # Lecture "bête" d'abord, sans se soucier des headers
+                # on laisse pandas gérer le début
+                df_raw = pd.read_csv(f, sep='|', engine='python', header=None, on_bad_lines='skip')
                 
-                has_header = True
-                try:
-                    val = float(parts[1])
-                    if val > 1_000_000_000:
-                        has_header = False
-                except:
-                    pass
+                # Nettoyage des noms de colonnes (qui seront 0, 1, 2...)
+                df_raw.columns = [str(i) for i in range(len(df_raw.columns))]
                 
-                if not has_header:
-                    df_raw = pd.read_csv(f, sep='|', header=None, engine='python')
-                    df_raw = df_raw.iloc[:, [1, 2, 3, 4]] 
-                    df_raw.columns = ['time', 'lat', 'lon', 'ele']
-                else:
-                    df_raw = pd.read_csv(f, sep='|', engine='python')
-                    df_raw.columns = [c.strip() for c in df_raw.columns]
-                    mapping = {}
-                    for c in df_raw.columns:
-                        cl = c.lower()
-                        if 'time' in cl: mapping['time'] = c
-                        elif 'lat' in cl: mapping['lat'] = c
-                        elif 'lon' in cl: mapping['lon'] = c
-                        elif 'alt' in cl or 'ele' in cl: mapping['ele'] = c
-                    if len(mapping) == 4:
-                        df_raw = df_raw[list(mapping.values())]
-                        df_raw.columns = ['time', 'lat', 'lon', 'ele']
-                    else:
-                        df_raw = df_raw.iloc[:, [1, 2, 3, 4]]
-                        df_raw.columns = ['time', 'lat', 'lon', 'ele']
+                # Identification intelligente des colonnes Time, Lat, Lon, Alt
+                indices = identify_gps_columns(df_raw)
+                
+                if indices is None:
+                    st.error("Impossible d'identifier automatiquement les colonnes GPS.")
+                    st.write("Aperçu des données brutes :")
+                    st.dataframe(df_raw.head())
+                    return None, None
+                
+                # Sélection et renommage des colonnes
+                idx_time, idx_lat, idx_lon, idx_ele = indices
+                df_raw = df_raw.iloc[:, [idx_time, idx_lat, idx_lon, idx_ele]]
+                df_raw.columns = ['time', 'lat', 'lon', 'ele']
 
-                df_raw['time'] = pd.to_datetime(df_raw['time'], unit='s', utc=True, errors='coerce')
+                # Conversion des types
+                df_raw['time'] = pd.to_numeric(df_raw['time'], errors='coerce')
                 df_raw['lat'] = pd.to_numeric(df_raw['lat'], errors='coerce')
                 df_raw['lon'] = pd.to_numeric(df_raw['lon'], errors='coerce')
                 df_raw['ele'] = pd.to_numeric(df_raw['ele'], errors='coerce')
+                
+                # Conversion timestamp Unix en Datetime UTC
+                df_raw['time'] = pd.to_datetime(df_raw['time'], unit='s', utc=True, errors='coerce')
+                
+                # Nettoyage final
                 df_raw = df_raw.dropna(subset=['time', 'lat', 'lon', 'ele'])
                 df_raw = df_raw.sort_values('time').reset_index(drop=True)
+
                 return df_raw, metadata_segments
 
     except Exception as e:
-        st.error(f"Erreur lecture Slope: {e}")
+        st.error(f"Erreur lors de la lecture du fichier Slope: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None
 
 # --- CORE LOGIC ---
@@ -281,30 +345,19 @@ class SkiSession:
         df['g_long'] = (df['accel'] / 9.81).abs()
         df['g_long'] = df['g_long'].fillna(0)
 
-        # 5. FORCE G LATÉRALE (Virages / Carving) - NOUVEAU
-        # Calcul du cap (bearing)
+        # 5. FORCE G LATÉRALE (Virages / Carving)
         df['bearing'] = np.arctan2(np.radians(df['lon']).diff(), np.radians(df['lat']).diff()) * 180 / np.pi
-        # Variation de l'angle
         df['bearing_diff'] = df['bearing'].diff().fillna(0)
-        # Angle de virage en radians
         df['turn_angle_rad'] = np.radians(np.abs(df['bearing_diff']))
-        # Rayon de courbure : r = distance / angle
-        # On évite la division par zéro pour les lignes droites
-        df['turn_angle_rad'] = df['turn_angle_rad'].replace(0, np.inf)
+        df['turn_angle_rad'] = df['turn_angle_rad'].replace(0, np.inf) # Évite div par 0
         df['radius'] = df['dist'] / df['turn_angle_rad']
-        # Accélération centripète : a = v² / r
         df['centripetal_accel'] = (df['speed_ms']**2) / df['radius']
         df['g_lat'] = (df['centripetal_accel'] / 9.81)
-        # Clipper les valeurs aberrantes (GPS noise)
-        df['g_lat'] = df['g_lat'].clip(0, 5)
+        df['g_lat'] = df['g_lat'].clip(0, 5) # Clip valeurs aberrantes
 
-        # 6. RUGOSITÉ (État de la neige) - NOUVEAU
-        # Écart type de l'altitude brute sur une courte fenêtre
-        # Plus c'est haut, plus c'est bosselé ou dur
+        # 6. RUGOSITÉ
         df['roughness'] = df['ele'].rolling(window=5, center=True).std()
         df['roughness'] = df['roughness'].fillna(0)
-        
-        # Angle de virage en degrés pour l'affichage
         df['turn_angle'] = df['bearing_diff'].clip(-180, 180)
 
         # 7. Segmentation (XML Truth)
@@ -379,9 +432,7 @@ class Visualizer:
 
     @staticmethod
     def plot_elevation_distance(df):
-        """Nouveau : Altitude vs Distance (Indépendant de la vitesse)."""
-        # Calcul distance cumulée
-        df['cumul_dist'] = df['dist'].cumsum() / 1000 # en km
+        df['cumul_dist'] = df['dist'].cumsum() / 1000 
         df_ski = df[df['state']=='Ski']
         fig = px.line(df_ski, x='cumul_dist', y='ele_smooth', title="Profil Altitudique (Distance)", labels={'cumul_dist': 'Distance (km)', 'ele_smooth': 'Altitude (m)'})
         fig.update_traces(line_color='#007FFF')
@@ -398,25 +449,15 @@ class Visualizer:
 
     @staticmethod
     def plot_g_forces(df):
-        """Nouveau : Histogramme des G Latéraux et Longitudinaux."""
         df_ski = df[df['state']=='Ski']
-        
-        # On filtre les valeurs nulles pour le graph
         df_lat = df_ski[df_ski['g_lat'] > 0.1]['g_lat']
-        
         fig = go.Figure()
-        fig.add_trace(go.Histogram(
-            x=df_lat, 
-            name='G Latéral (Virage)',
-            opacity=0.75,
-            marker_color='#FF0000'
-        ))
+        fig.add_trace(go.Histogram(x=df_lat, name='G Latéral (Virage)', opacity=0.75, marker_color='#FF0000'))
         fig.update_layout(title="Distribution des Forces G (Virages)", xaxis_title="G Force", yaxis_title="Fréquence", template='plotly_white', barmode='overlay')
         return fig
 
     @staticmethod
     def plot_rugosity(df):
-        """Nouveau : Rugosité de la piste."""
         df_ski = df[df['state']=='Ski']
         fig = px.line(df_ski, x='time', y='roughness', title="Rugosité (Bosses / Neige)", labels={'roughness': 'Indice de Rugosité'})
         fig.update_traces(line_color='#8B4513')
@@ -430,7 +471,6 @@ class Visualizer:
         
         for run in runs:
             path_df = run.df[['lon', 'lat']].iloc[::5]
-            # Couleur basée sur la vitesse moyenne de la descente
             avg_speed = run.avg_speed
             color = get_speed_color(avg_speed)
             
@@ -440,42 +480,15 @@ class Visualizer:
                 "name": f"Run {run.id} ({avg_speed:.0f} km/h)"
             })
 
-        path_layer = pdk.Layer(
-            "PathLayer",
-            data=pd.DataFrame(path_data),
-            pickable=True,
-            get_path="path",
-            get_color="color",
-            width_min_pixels=4,
-            tooltip=True
-        )
+        path_layer = pdk.Layer("PathLayer", data=pd.DataFrame(path_data), pickable=True, get_path="path", get_color="color", width_min_pixels=4, tooltip=True)
+        heatmap_layer = pdk.Layer("HeatmapLayer", data=heatmap_df, get_position=['lon', 'lat'], get_weight='speed_kmh', radius_pixels=25)
 
-        heatmap_layer = pdk.Layer(
-            "HeatmapLayer",
-            data=heatmap_df,
-            get_position=['lon', 'lat'],
-            get_weight='speed_kmh',
-            radius_pixels=25,
-        )
-
-        view_state = pdk.ViewState(
-            latitude=df['lat'].mean(),
-            longitude=df['lon'].mean(),
-            zoom=13,
-            pitch=45,
-        )
+        view_state = pdk.ViewState(latitude=df['lat'].mean(), longitude=df['lon'].mean(), zoom=13, pitch=45)
 
         map_style = "mapbox://styles/mapbox/outdoors-v11" if mapbox_token else pdk.map_styles.CARTO_LIGHT
         provider = "mapbox" if mapbox_token else "carto"
 
-        return pdk.Deck(
-            layers=[heatmap_layer, path_layer],
-            initial_view_state=view_state,
-            map_style=map_style,
-            map_provider=provider,
-            tooltip={"text": "{name}\nAlt: {ele_smooth}m\nVit: {speed_kmh} km/h"},
-            api_key=mapbox_token
-        )
+        return pdk.Deck(layers=[heatmap_layer, path_layer], initial_view_state=view_state, map_style=map_style, map_provider=provider, tooltip={"text": "{name}\nAlt: {ele_smooth}m\nVit: {speed_kmh} km/h"}, api_key=mapbox_token)
 
 # --- MAIN APP ---
 
@@ -507,11 +520,8 @@ def main():
 
             # --- REPLAY / SLIDER ---
             st.sidebar.subheader("⏱️ Replay Temporel")
-            # Créer un slider de sélection de temps
             min_time = session.df['time'].min().to_pydatetime()
             max_time = session.df['time'].max().to_pydatetime()
-            
-            # Conversion en secondes relatives pour le slider
             min_ts = (min_time - min_time).total_seconds()
             max_ts = (max_time - min_time).total_seconds()
             
@@ -520,11 +530,10 @@ def main():
                 min_value=float(min_ts),
                 max_value=float(max_ts),
                 value=(float(min_ts), float(max_ts)),
-                step=60.0, # Pas de 60 secondes
+                step=60.0,
                 format="HH:MM"
             )
             
-            # Filtrer le dataframe selon le slider
             start_filter = min_time + timedelta(seconds=time_range[0])
             end_filter = min_time + timedelta(seconds=time_range[1])
             
@@ -536,13 +545,10 @@ def main():
             else:
                 st.info(f"Analyse de la période : {start_filter.strftime('%H:%M')} à {end_filter.strftime('%H:%M')}")
 
-            # --- ONGLETS ---
             tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🎿 Liste des Descentes", "📉 Analyse Technique", "🗺️ Carte 3D"])
 
             with tab1:
                 st.header("Vue d'ensemble")
-                
-                # Calcul des stats sur la période filtrée (ou globale si tout sélectionné)
                 stats_f = {
                     "distance": df_filtered['dist'].sum() / 1000,
                     "max_speed": df_filtered['speed_kmh'].max(),
@@ -602,7 +608,7 @@ def main():
 
             with tab4:
                 st.header("Carte Interactive 3D")
-                st.caption("Le tracé est colorié selon la vitesse moyenne de la descente.")
+                st.caption("Le tracé est coloré selon la vitesse moyenne de la descente.")
                 deck_chart = Visualizer.create_deck_map(session.df, session.runs, mapbox_token)
                 st.pydeck_chart(deck_chart)
 
