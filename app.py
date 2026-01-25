@@ -14,7 +14,7 @@ from dateutil import parser as date_parser
 # --- CONFIGURATION ---
 st.set_page_config(
     page_title="Ski Analytics Pro - Filtre Altitude Edition", 
-    layout="wideset", 
+    layout="wide", 
     page_icon="🏔️",
     initial_sidebar_state="expanded"
 )
@@ -89,7 +89,7 @@ def get_weather_cached(lat, lon):
 # --- PARSERS (ROBUSTE) ---
 
 def parse_slope_metadata(zip_file):
-    """Extrait les actions Lift/Run du XML."""
+    """Extrait les actions Lift/Run du XML et retourne une dict d'infos brutes."""
     try:
         st.info("📂 1/3 : Extraction des métadonnées (XML)...")
         metadata_files = [f for f in zip_file.namelist() if 'metadata' in f.lower()]
@@ -103,13 +103,13 @@ def parse_slope_metadata(zip_file):
             tree = ET.parse(f)
             root = tree.getroot()
             
-            segments = []
+            actions = []
             for action in root.findall('.//Action'):
-                action_type = action.get('type')
+                action_type = action.get('type') 
                 start_str = action.get('start')
                 end_str = action.get('end')
                 max_alt = action.get('maxAlt')
-                min_alt = action.get('min_alt')
+                min_alt = action.get('minAlt')
                 
                 if start_str and end_str:
                     try:
@@ -118,7 +118,7 @@ def parse_slope_metadata(zip_file):
                         start_utc = start_dt.astimezone(timezone.utc)
                         end_utc = end_dt.astimezone(timezone.utc)
                         
-                        segments.append({
+                        actions.append({
                             'type': action_type,
                             'start': start_utc,
                             'end': end_utc,
@@ -128,11 +128,11 @@ def parse_slope_metadata(zip_file):
                         })
                     except Exception:
                         continue
-            if segments:
-                st.success(f"✅ {len(segments)} segments (Lifts/Runs) détectés.")
+            if actions:
+                st.success(f"✅ {len(actions)} actions détectés.")
             else:
                 st.warning("⚠️ Aucun segment 'Action' trouvé dans le XML.")
-            return segments
+            return actions
     except Exception as e:
         st.error(f"Erreur parsing XML: {e}")
         return None
@@ -192,7 +192,8 @@ def identify_gps_columns(df_raw):
         st.text(f"Colonnes identifiées -> Time:{mapping['time']}, Lat:{mapping['lat']}, Lon:{mapping['lon']}, Alt:{mapping['ele']}")
         return [mapping['time'], mapping['lat'], mapping['lon'], mapping['ele']]
     else:
-        st.error("Échec de l'identification automatique des colonnes GPS.")
+        st.error("Échec de l'identification automatique.")
+        st.write(mapping)
         return None
 
 def load_slope_file(uploaded_file):
@@ -226,6 +227,7 @@ def load_slope_file(uploaded_file):
             st.text(f"Fichier trouvé : {target_csv}")
 
             with z.open(target_csv) as f:
+                # Regex pour accepter Pipe, Virgule OU Tabulation
                 df_raw = pd.read_csv(f, sep=r'[|,\t]', engine='python', header=None, on_bad_lines='skip')
                 
                 if df_raw.empty:
@@ -249,6 +251,7 @@ def load_slope_file(uploaded_file):
                 df_raw = df_raw.iloc[:, [idx_time, idx_lat, idx_lon, idx_ele]].copy()
                 df_raw.columns = ['time', 'lat', 'lon', 'ele']
 
+                # Conversion Types
                 df_raw['time'] = pd.to_numeric(df_raw['time'], errors='coerce')
                 df_raw['lat'] = pd.to_numeric(df_raw['lat'], errors='coerce')
                 df_raw['lon'] = pd.to_numeric(df_raw['lon'], errors='coerce')
@@ -275,12 +278,20 @@ class SkiRun:
     def __init__(self, run_id, df_segment):
         self.id = run_id
         self.df = df_segment.copy()
-        self.metadata = None # On stocke les infos XML pour l'affichage
-        self.start_time = self.df['time'].iloc[0]
-        self.end_time = self.df['time'].iloc[-1]
+        self.metadata = None 
+        
+        if not self.df.empty:
+            self.start_time = self.df['time'].iloc[0]
+            self.end_time = self.df['time'].iloc[-1]
+        else:
+            self.start_time = None
+            self.end_time = None
         self._analyze()
         
     def _analyze(self):
+        if self.df.empty:
+            return
+            
         self.duration_sec = (self.end_time - self.start_time).total_seconds()
         self.distance_m = self.df['dist'].sum()
         
@@ -314,12 +325,12 @@ class SkiRun:
 
     def get_metrics(self):
         display_alt = int(self.metadata['max_alt']) if self.metadata and self.metadata['max_alt'] else (int(self.df['ele'].max()) if not self.df.empty else 0)
+        
         return {
             "N°": self.id,
             "Durée": f"{int(self.duration_sec//60)}:{int(self.duration_sec%60):02d}",
             "Distance": f"{int(self.distance_m)} m",
             "Dénivelé": f"{int(self.drop_m)} m",
-            "Alt Max (m)": display_alt,
             "Vitesse Max": f"{int(self.max_speed)} km/h",
             "Vitesse Moy": f"{self.avg_speed:.1f} km/h",
             "G Lat Max": f"{self.max_g_lat:.2f} G",
@@ -359,7 +370,7 @@ class SkiSession:
             g = abs(g)
             for k, v in DIFFICULTY_THRESHOLDS.items():
                 if v['min'] <= g < v['max']: return k, v['hex']
-            return 'Noire', '#D3D3D3D'
+            return 'Noire', '#D3D3D3'
         diff_data = df['gradient'].apply(get_diff)
         df['color_name'] = [x[0] for x in diff_data]
         df['hex_color'] = [x[1] for x in diff_data]
@@ -386,7 +397,7 @@ class SkiSession:
         df['roughness'] = df['roughness'].fillna(0)
         df['turn_angle'] = df['bearing_diff'].clip(-180, 180)
 
-        # 7. Segmentation (XML Truth)
+        # 7. Segmentation (XML Truth + Fallback)
         df['state'] = 'Arret'
         if self.metadata_actions:
             for seg in self.metadata_actions:
@@ -399,10 +410,11 @@ class SkiSession:
                         df.loc[mask_seg, 'state'] = 'Remontee'
                     elif action_type == 'run':
                         df.loc[mask_seg, 'state'] = 'Ski'
-        else:
-            # Fallback Heuristique (si pas de métadonnées)
-            is_lift = (df['speed_kmh'] < 25) & (df['speed_kmh'] > 2) & (df['grade_raw'] > 0.5)
-            df.loc[is_lift, 'state'] = 'Remontee'
+        
+        # Fallback si aucun run détecté (XML incomplet)
+        df_ski = df[df['state']=='Ski']
+        if df_ski.empty:
+            st.warning("Aucun segment 'Ski' trouvé via XML. Utilisation de l'heuristique.")
             is_ski = (df['speed_kmh'] > 5) & (df['grade_raw'] < -0.5)
             df.loc[is_ski, 'state'] = 'Ski'
 
@@ -411,22 +423,31 @@ class SkiSession:
 
     def _detect_runs(self):
         # Passer le min_drop depuis l'extérieur
-        min_drop = st.session_state.get('min_drop', 20.0) # Par défaut 20m
-        min_duration = st.session_state.get('min_duration', 30.0) # Par défaut 30s
-
-        df = self.df
+        min_drop = st.session_state.get('min_drop', 20.0)
+        min_duration = st.session_state.get('min_duration', 30.0)
+        
         df['segment'] = (df['state'] != df['state'].shift()).cumsum()
         run_id = 1
+        
         for seg_id, group in df.groupby('segment'):
             if group['state'].iloc[0] != 'Ski':
                 continue
             
             duration = group['dt'].sum()
-            # Correction : utiliser l'altitude brute (non lissée) pour calcul du dénivelé
-            drop = group['ele'].max() - group['ele'].min() # Calcul plus fiable
-            # Si le fichier a un dénivelé (ex: 30m), il sera ignoré par le filtre.
+            # Correction : utiliser l'altitude brute pour le calcul du drop du run (plus fiable que lissée pour les petits tronçons)
+            drop = group['ele'].max() - group['ele'].min() 
             
             if duration < min_duration or drop < min_drop: continue
+            
+            # On cherche la métadonnée pour ce run
+            run_meta = None
+            for action in self.metadata_actions:
+                if action['type'] == 'Run':
+                    start_t = action['start']
+                    end_t = action['end']
+                    if start_t <= group['time'].min() and end_t >= group['time'].max():
+                        run_meta = action
+                        break
             
             run = SkiRun(run_id, group)
             self.runs.append(run_obj)
@@ -436,7 +457,6 @@ class SkiSession:
         total_dist = self.df['dist'].sum() / 1000
         df_ski = self.df[self.df['state']=='Ski']
         total_descent = df_ski['ele'].max() - df_ski['ele'].min() if not df_ski.empty else 0
-        
         ski_time_hours = df_ski['dt'].sum() / 3600
         met = 6.5
         calories = int(met * self.user_weight * ski_time_hours)
@@ -446,6 +466,7 @@ class SkiSession:
             "distance": total_dist,
             "descent": total_descent,
             "max_speed": self.df['speed_kmh'].max(),
+            "max_lat_g": df_ski['g_lat'].max() if not df_ski.empty else 0,
             "max_alt": self.df['ele'].max(),
             "calories": calories,
             "duration": f"{int(ski_time_hours)}h {int((ski_time_hours%1)*60)}m"
@@ -478,7 +499,7 @@ class Visualizer:
         df_ski = df[df['state']=='Ski']
         if df_ski.empty: return go.Figure()
         
-        fig = px.line(df_ski, x='cumul_dist', y='ele', title="Profil Altitudique (Distance)", labels={'cumul_dist': 'Distance (km)', 'ele': 'Altitude (m)'})
+        fig = px.line(df_ski, x='cumul_dist', y='ele_smooth', title="Profil Altitudique (Distance)", labels={'cumul_dist': 'Distance (km)', 'ele_smooth': 'Altitude (m)'})
         fig.update_traces(line_color='#007FFF')
         fig.update_layout(template='plotly_white')
         return fig
@@ -558,16 +579,17 @@ def main():
         
         st.subheader("Préférences")
         mapbox_token = st.text_input("Mapbox Token (Optionnel)", type="password")
-        
+
         # --- AJOUT ---
         st.subheader("Filtres de détection")
-        min_drop = st.slider("Dénivelé minimum pour une descente (m)", 0.0, 50.0, value=20.0, step=1.0)
-        #min_duration = st.slider("Durée minimum (sec)", 0.0, 60.0, value=10.0, step=5.0)
-        st.write("Faites glisser pour inclure les pistes plates (traversées).")
-    
-        # Stockage dans session_state pour l'utilisation dans les fonctions
-        st.session_state['min_drop'] = min_drop
-        # st.session_state['min_duration'] = min_duration # Optionnel
+        min_drop = st.slider("Dénivelé minimum d'une descente (m)", 0.0, 50.0, 20.0, 1.0)
+        min_duration = st.slider("Durée minimum d'une descente (s)", 0.0, 300.0, 30.0, 5.0)
+        st.write("Ajustez ces valeurs pour inclure les traversées plates dans les statistiques.")
+        
+        if 'min_drop' not in st.session_state:
+            st.session_state['min_drop'] = 20.0
+        if 'min_duration' not in st.session_state:
+            st.session_state['min_duration'] = 30.0
 
     if uploaded_file:
         try:
@@ -581,7 +603,7 @@ def main():
 
                 if metadata is None:
                     st.warning("⚠️ Les métadonnées XML n'ont pas pu être lues. Utilisation du mode Heuristique.")
-                
+
                 session = SkiSession(raw_df, user_weight, metadata_actions=metadata)
                 
             st.success(f"Session analysée : {len(session.runs)} descentes détectées.")
@@ -608,9 +630,8 @@ def main():
             df_filtered = session.df[(session.df['time'] >= pd.Timestamp(start_filter)) & 
                                      (session.df['time'] <= pd.Timestamp(end_filter))]
             
-            # Fallback pour éviter les graphiques vides si le filtre ne contient que de l'arrêt
-            if df_filtered.empty or (df_filtered['state'] != 'Ski').all():
-                st.warning("La sélection temporelle ne contient que de l'arrêt. Affichage de la session complète.")
+            if df_filtered.empty:
+                st.warning("La sélection temporelle est vide. Affichage de la session complète.")
                 df_filtered = session.df
             else:
                 st.info(f"Analyse de la période : {start_filter.strftime('%H:%M')} à {end_filter.strftime('%H:%M')}")
@@ -662,7 +683,7 @@ def main():
                         fig_detail = px.line(run_obj.df, x='time', y='speed_kmh', title=f"Vitesse Descente #{run_obj.id}")
                         st.plotly_chart(fig_detail, use_container_width=True)
                 else:
-                    st.warning("Aucune donnée de descente à afficher (ou filtre trop restreint).")
+                    st.warning("Aucune donnée de descente à afficher (peut-être à cause de dates incohérentes dans le fichier).")
 
             with tab3:
                 st.header("Physique & Technique")
