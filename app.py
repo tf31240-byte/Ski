@@ -13,7 +13,7 @@ from dateutil import parser as date_parser
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="Ski Analytics Pro - Robust Edition", 
+    page_title="Ski Analytics Pro - Fixed Edition", 
     layout="wide", 
     page_icon="🏔️",
     initial_sidebar_state="expanded"
@@ -39,7 +39,8 @@ DIFFICULTY_THRESHOLDS = {
 def calculate_distance_vectorized(df):
     """
     Calcul vectorisé de la distance Haversine (en mètres).
-    Correction : Ajout de np.clip pour éviter les erreurs numériques sur arcsin.
+    CORRECTION : Retrait de l'append pour garantir la concordance des longueurs avec l'index.
+    La distance du dernier point est NaN (car pas de point suivant), ce qui est normal.
     """
     lat1, lon1 = np.radians(df['lat'].values), np.radians(df['lon'].values)
     lat2, lon2 = np.radians(df['lat'].shift(-1).values), np.radians(df['lon'].shift(-1).values)
@@ -48,30 +49,24 @@ def calculate_distance_vectorized(df):
     dlon = lon2 - lon1
     
     a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
-    # Clip pour s'assurer que la valeur est entre -1 et 1 (évite NaN)
+    # Clip pour s'assurer que la valeur est entre -1 et 1 (évite NaN) et arcsin ne renvoie pas d'erreur
     c = 2 * np.arcsin(np.clip(a, 0, 1)) 
     
-    return pd.Series(np.append(c * 6371000, 0), index=df.index)
+    # CORRECTION ICI : Pas d'append. On retourne une série de même taille que l'index df.
+    # La dernière valeur sera NaN (normal) ou 0 selon le clip.
+    return pd.Series(c * 6371000, index=df.index)
 
 def smooth_series(series, window_length=21, polyorder=2):
-    """
-    Lissage sécurisé.
-    Correction : Vérification que window_length est impair + retour d'un pd.Series.
-    """
+    """Lissage sécurisé."""
     if len(series) < window_length:
         return series
-    
-    # Correction : S'assurer que la fenêtre est impaire (requis pour Savitzky-Golay)
+    # S'assurer que la fenêtre est impaire
     if window_length % 2 == 0:
         window_length += 1
-        
-    # Interpolation pour remplir les NaN avant le lissage
     if series.isnull().any():
         series = series.interpolate(method='linear').ffill().bfill()
-    
     try:
         result = savgol_filter(series, window_length=window_length, polyorder=polyorder)
-        # Correction : Retourner une Series pour préserver l'index (Time)
         return pd.Series(result, index=series.index)
     except Exception:
         return series
@@ -145,10 +140,7 @@ def parse_slope_metadata(zip_file):
         return None
 
 def identify_gps_columns(df_raw):
-    """
-    Détecte intelligemment les colonnes Time, Lat, Lon, Alt.
-    Amélioration : Plages restrictives Europe (40-50°N, -10-20°E) pour éviter les confusions.
-    """
+    """Détecte intelligemment les colonnes Time, Lat, Lon, Alt (Europe)."""
     st.text("🔍 Analyse de la structure du CSV en cours...")
     
     if df_raw.empty:
@@ -186,7 +178,6 @@ def identify_gps_columns(df_raw):
             if num_val > 1_000_000_000: 
                 mapping['time'] = idx
                 
-        # Amélioration : Plage plus restrictive pour l'Europe (Tignes ~45N, 6E)
         if mapping['lat'] is None:
             if 40 <= num_val <= 50: 
                 mapping['lat'] = idx
@@ -237,7 +228,6 @@ def load_slope_file(uploaded_file):
             st.text(f"Fichier trouvé : {target_csv}")
 
             with z.open(target_csv) as f:
-                # Regex pour accepter Pipe, Virgule OU Tabulation
                 df_raw = pd.read_csv(f, sep=r'[|,\t]', engine='python', header=None, on_bad_lines='skip')
                 
                 if df_raw.empty:
@@ -246,7 +236,6 @@ def load_slope_file(uploaded_file):
 
                 df_raw.columns = [str(i) for i in range(len(df_raw.columns))]
                 
-                # Identification colonnes
                 indices = identify_gps_columns(df_raw)
                 
                 if indices is None:
@@ -259,11 +248,9 @@ def load_slope_file(uploaded_file):
                     st.error(f"Erreur critique : Index de colonne {max_idx} supérieur au nombre de colonnes ({len(df_raw.columns)})")
                     return None, None
 
-                # Amélioration : Utilisation de .copy() pour éviter SettingWithCopyWarning
                 df_raw = df_raw.iloc[:, [idx_time, idx_lat, idx_lon, idx_ele]].copy()
                 df_raw.columns = ['time', 'lat', 'lon', 'ele']
 
-                # Conversion Types
                 df_raw['time'] = pd.to_numeric(df_raw['time'], errors='coerce')
                 df_raw['lat'] = pd.to_numeric(df_raw['lat'], errors='coerce')
                 df_raw['lon'] = pd.to_numeric(df_raw['lon'], errors='coerce')
@@ -299,17 +286,14 @@ class SkiRun:
         self._analyze()
         
     def _analyze(self):
-        # Correction : Gestion des DataFrames vides
         if self.df.empty:
             return
-            
         self.duration_sec = (self.end_time - self.start_time).total_seconds()
         self.distance_m = self.df['dist'].sum()
         self.drop_m = self.df['ele'].max() - self.df['ele'].min()
         self.max_speed = self.df['speed_kmh'].max()
         self.avg_speed = self.df['speed_kmh'].mean()
         
-        # Amélioration : Gestion robuste des NaN (fillna(0))
         self.max_g_lat = self.df['g_lat'].max()
         self.max_g_long = self.df['g_long'].max()
         self.avg_rugosity = self.df['roughness'].mean()
@@ -330,7 +314,6 @@ class SkiRun:
             self.avg_turn_angle = 0
 
     def get_metrics(self):
-        # S'assurer que les valeurs sont valides (pas de NaN)
         return {
             "N°": self.id,
             "Durée": f"{int(self.duration_sec//60)}:{int(self.duration_sec%60):02d}",
@@ -386,12 +369,11 @@ class SkiSession:
         df['g_long'] = df['g_long'].fillna(0)
 
         # 5. FORCE G LATÉRALE
-        # Correction : Division par zéro et remplacement de replace par np.where
         df['bearing'] = np.arctan2(np.radians(df['lon']).diff(), np.radians(df['lat']).diff()) * 180 / np.pi
         df['bearing_diff'] = df['bearing'].diff().fillna(0)
         df['turn_angle_rad'] = np.radians(np.abs(df['bearing_diff']))
         
-        # Masque pour éviter la division par zéro (lignes droites)
+        # Protection division par zéro (lignes droites)
         mask_turn = df['turn_angle_rad'] > 0.01
         df['radius'] = np.where(mask_turn, df['dist'] / df['turn_angle_rad'], np.inf)
         
@@ -405,7 +387,6 @@ class SkiSession:
         df['turn_angle'] = df['bearing_diff'].clip(-180, 180)
 
         # 7. Segmentation (XML Truth + Fallback)
-        # Correction : Segmentation fallback si pas de métadonnées XML
         df['state'] = 'Arret'
         if self.metadata_segments:
             for seg in self.metadata_segments:
@@ -464,14 +445,8 @@ class SkiSession:
 class Visualizer:
     @staticmethod
     def plot_elevation_time(df):
-        # Correction : Gestion DataFrames vides
-        if df.empty:
-            return go.Figure()
-            
+        if df.empty: return go.Figure()
         df_ski = df[df['state']=='Ski']
-        if df_ski.empty:
-            return go.Figure()
-
         fig = go.Figure()
         for color in df_ski['color_name'].unique():
             mask = df_ski['color_name'] == color
@@ -486,9 +461,7 @@ class Visualizer:
 
     @staticmethod
     def plot_elevation_distance(df):
-        if df.empty:
-            return go.Figure()
-        
+        if df.empty: return go.Figure()
         df['cumul_dist'] = df['dist'].cumsum() / 1000 
         df_ski = df[df['state']=='Ski']
         fig = px.line(df_ski, x='cumul_dist', y='ele_smooth', title="Profil Altitudique (Distance)", labels={'cumul_dist': 'Distance (km)', 'ele_smooth': 'Altitude (m)'})
@@ -498,9 +471,7 @@ class Visualizer:
 
     @staticmethod
     def plot_speed(df):
-        if df.empty:
-            return go.Figure()
-            
+        if df.empty: return go.Figure()
         df_ski = df[df['state']=='Ski']
         fig = px.line(df_ski, x='time', y='speed_kmh', title="Vitesse", labels={'speed_kmh': 'km/h'})
         fig.update_traces(line_color='#007FFF')
@@ -509,9 +480,7 @@ class Visualizer:
 
     @staticmethod
     def plot_g_forces(df):
-        if df.empty:
-            return go.Figure()
-            
+        if df.empty: return go.Figure()
         df_ski = df[df['state']=='Ski']
         df_lat = df_ski[df_ski['g_lat'] > 0.1]['g_lat']
         fig = go.Figure()
@@ -522,9 +491,7 @@ class Visualizer:
 
     @staticmethod
     def plot_rugosity(df):
-        if df.empty:
-            return go.Figure()
-            
+        if df.empty: return go.Figure()
         df_ski = df[df['state']=='Ski']
         fig = px.line(df_ski, x='time', y='roughness', title="Rugosité (Bosses / Neige)", labels={'roughness': 'Indice de Rugosité'})
         fig.update_traces(line_color='#8B4513')
@@ -533,10 +500,7 @@ class Visualizer:
 
     @staticmethod
     def create_deck_map(df, runs, mapbox_token=None):
-        # Correction : Vérifications empty
-        if df.empty or not runs:
-            return pdk.Deck()
-            
+        if df.empty or not runs: return pdk.Deck()
         path_data = []
         heatmap_df = df[df['state']=='Ski'][['lon', 'lat', 'speed_kmh']].copy()
         if heatmap_df.empty:
@@ -560,7 +524,6 @@ class Visualizer:
         map_style = "mapbox://styles/mapbox/outdoors-v11" if mapbox_token else pdk.map_styles.CARTO_LIGHT
         provider = "mapbox" if mapbox_token else "carto"
 
-        # Correction : Utilisation de api_keys (pluriel) au lieu de api_key
         return pdk.Deck(layers=[heatmap_layer, path_layer], initial_view_state=view_state, map_style=map_style, map_provider=provider, tooltip={"text": "{name}\nAlt: {ele_smooth}m\nVit: {speed_kmh} km/h"}, api_keys=mapbox_token)
 
 # --- MAIN APP ---
@@ -599,7 +562,6 @@ def main():
             min_time = session.df['time'].min().to_pydatetime()
             max_time = session.df['time'].max().to_pydatetime()
             
-            # Correction : Calcul explicite et sécurisé du min_ts
             total_duration_sec = (max_time - min_time).total_seconds()
             
             time_range = st.sidebar.slider(
@@ -617,7 +579,6 @@ def main():
             df_filtered = session.df[(session.df['time'] >= pd.Timestamp(start_filter)) & 
                                      (session.df['time'] <= pd.Timestamp(end_filter))]
             
-            # Amélioration : Fallback sur session complète si filtre vide
             if df_filtered.empty:
                 st.warning("La sélection temporelle est vide. Affichage de la session complète.")
                 df_filtered = session.df
@@ -689,7 +650,7 @@ def main():
             st.error("Une erreur critique est survenue.")
             st.exception(e)
     else:
-        st.title("Ski Analytics Pro - Robust Edition")
+        st.title("Ski Analytics Pro - Fixed Edition")
         st.info("Veuillez charger un fichier .slopes.")
 
 if __name__ == "__main__":
