@@ -410,11 +410,10 @@ class SkiSession:
                         df.loc[mask_seg, 'state'] = 'Remontee'
                     elif action_type == 'run':
                         df.loc[mask_seg, 'state'] = 'Ski'
-        
-        # Fallback si aucun run détecté (XML incomplet)
-        df_ski = df[df['state']=='Ski']
-        if df_ski.empty:
-            st.warning("Aucun segment 'Ski' trouvé via XML. Utilisation de l'heuristique.")
+        else:
+            # Fallback Heuristique
+            is_lift = (df['speed_kmh'] < 25) & (df['speed_kmh'] > 2) & (df['grade_raw'] > 0.5)
+            df.loc[is_lift, 'state'] = 'Remontee'
             is_ski = (df['speed_kmh'] > 5) & (df['grade_raw'] < -0.5)
             df.loc[is_ski, 'state'] = 'Ski'
 
@@ -422,41 +421,43 @@ class SkiSession:
         self._detect_runs()
 
     def _detect_runs(self):
-        # Passer le min_drop depuis l'extérieur
+        # CORRECTION : On définit df explicitement ici pour éviter NameError
+        df = self.df
+        if df is None: return # Sécurité
+        
         min_drop = st.session_state.get('min_drop', 20.0)
-        min_duration = st.session_state.get('min_duration', 30.0)
         
         df['segment'] = (df['state'] != df['state'].shift()).cumsum()
         run_id = 1
-        
         for seg_id, group in df.groupby('segment'):
             if group['state'].iloc[0] != 'Ski':
                 continue
             
             duration = group['dt'].sum()
-            # Correction : utiliser l'altitude brute pour le calcul du drop du run (plus fiable que lissée pour les petits tronçons)
-            drop = group['ele'].max() - group['ele'].min() 
+            # Utilisation altitude brute pour calcul drop plus fiable sur petits tronçons
+            drop = group['ele'].max() - group['ele'].min()
             
-            if duration < min_duration or drop < min_drop: continue
+            if duration < 30 or drop < min_drop: continue
             
-            # On cherche la métadonnée pour ce run
+            # Récupération de la métadonnée associée
             run_meta = None
-            for action in self.metadata_actions:
-                if action['type'] == 'Run':
-                    start_t = action['start']
-                    end_t = action['end']
-                    if start_t <= group['time'].min() and end_t >= group['time'].max():
-                        run_meta = action
-                        break
+            if self.metadata_actions:
+                for action in self.metadata_actions:
+                    if action['type'] == 'Run':
+                        start_t = action['start']
+                        end_t = action['end']
+                        if start_t <= group['time'].min() and end_t >= group['time'].max():
+                            run_meta = action
+                            break
             
-            run = SkiRun(run_id, group)
+            run = SkiRun(run_id, group, metadata_data=run_meta)
             self.runs.append(run_obj)
             run_id += 1
 
     def get_global_stats(self):
         total_dist = self.df['dist'].sum() / 1000
         df_ski = self.df[self.df['state']=='Ski']
-        total_descent = df_ski['ele'].max() - df_ski['ele'].min() if not df_ski.empty else 0
+        total_descent = df_ski['ele_smooth'].max() - df_ski['ele_smooth'].min() if not df_ski.empty else 0
         ski_time_hours = df_ski['dt'].sum() / 3600
         met = 6.5
         calories = int(met * self.user_weight * ski_time_hours)
@@ -467,7 +468,7 @@ class SkiSession:
             "descent": total_descent,
             "max_speed": self.df['speed_kmh'].max(),
             "max_lat_g": df_ski['g_lat'].max() if not df_ski.empty else 0,
-            "max_alt": self.df['ele'].max(),
+            "max_alt": self.df['ele_smooth'].max(),
             "calories": calories,
             "duration": f"{int(ski_time_hours)}h {int((ski_time_hours%1)*60)}m"
         }
