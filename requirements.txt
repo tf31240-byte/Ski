@@ -4,4 +4,4 @@ numpy
 plotly
 pydeck
 scipy
-geopandas shapely requests python-dateutil
+geopandas shapely
