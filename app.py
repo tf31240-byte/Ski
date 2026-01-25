@@ -5,9 +5,10 @@ Fonctionnalités :
 - Replay 3D Interactif (First Person View)
 - Analyse Biomécanique (Équilibre G/D, Symétrie, Fatigue)
 - Heatmaps (Vitesse, G-Force, Fréquentation)
-- Météo Contextuelle
+- Détection automatique des noms de pistes (OpenStreetMap)
 """
 
+import sys
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -23,7 +24,16 @@ from dateutil import parser as date_parser
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict
 from enum import Enum
-import requests  # Pour la météo
+import requests
+
+# Tentative d'import pour la géométrie (Obligatoire pour les pistes)
+try:
+    import geopandas as gpd
+    from shapely.geometry import Point, shape
+    HAS_GEOS = True
+except ImportError:
+    HAS_GEOS = False
+    st.warning("⚠️ 'geopandas' et 'shapely' non installés. La détection des pistes sera désactivée. Installez-les avec `pip install geopandas shapely`.")
 
 st.set_page_config(page_title="Ski Analytics Pro Ultimate", layout="wide")
 
@@ -80,8 +90,8 @@ class Biomechanics:
     right_turns_count: int = 0
     avg_g_left: float = 0.0
     avg_g_right: float = 0.0
-    carving_symmetry_score: float = 0.0  # 0 = déséquilibré, 1 = parfait
-    stability_index: float = 0.0         # Stabilité globale
+    carving_symmetry_score: float = 0.0
+    stability_index: float = 0.0
 
 @dataclass
 class Action:
@@ -105,9 +115,8 @@ class Action:
     avg_turn: float = 0.0
     max_roughness: float = 0.0
     
-    # Nouvelles données biomécaniques
     biomechanics: Biomechanics = field(default_factory=Biomechanics)
-    fatigue_score: float = 0.0  # Basé sur la dégradation technique
+    fatigue_score: float = 0.0
 
 # ============================================================================
 # PARSING & DATA LOADING
@@ -125,7 +134,6 @@ def parse_metadata(zip_file: zipfile.ZipFile) -> Tuple[Optional[Activity], List[
             
             if act_elem is None: return None, []
             
-            # Parsing Activité
             activity = Activity(
                 location=act_elem.get('locationName', 'Unknown'),
                 start=date_parser.parse(act_elem.get('start')).astimezone(timezone.utc),
@@ -137,11 +145,8 @@ def parse_metadata(zip_file: zipfile.ZipFile) -> Tuple[Optional[Activity], List[
                 top_speed=float(act_elem.get('topSpeed', 0)),
                 conditions=act_elem.get('conditions', 'unknown')
             )
-            
-            # Récupération Météo (Mock ou API)
             activity.weather = get_weather(activity.location, activity.start, activity.end)
             
-            # Parsing Actions
             actions = []
             action_elems = root.findall('.//Action')
             
@@ -170,15 +175,7 @@ def parse_metadata(zip_file: zipfile.ZipFile) -> Tuple[Optional[Activity], List[
         return None, []
 
 def get_weather(location: str, start: datetime, end: datetime) -> Weather:
-    """Simule ou récupère la météo. Utilise Open-Meteo (gratuit) si date passée."""
-    # Note: Les données fournies sont en 2026. L'API renverra une erreur.
-    # On simule donc des données réalistes pour Tignes/Val d'Isère.
-    
-    # Tentative réelle (désactivée pour le demo futur):
-    # lat, lon = 45.4, 6.9 # Coordonnées approx Tignes
-    # url = f"https://archive-api.open-meteo.com/v1/era5?latitude={lat}&longitude={lon}&start_date={start.date()}&end_date={end.date()}&hourly=temperature_2m,wind_speed_10m"
-    
-    # MOCK DATA pour la démo
+    """Simule ou récupère la météo."""
     return Weather(
         temp_avg=-5.0,
         wind_max=15.0,
@@ -192,11 +189,9 @@ def load_gps(zip_file: zipfile.ZipFile) -> Optional[pd.DataFrame]:
         if not target: return None
         
         with zip_file.open(target) as f:
-            # Lecture CSV robuste
             df = pd.read_csv(f, sep=r'[|,\t]', engine='python', header=None, on_bad_lines='skip')
             
-            # Auto-détection colonnes (simplifiée par rapport aux données fournies)
-            # Format donné: Time, Lat, Lon, Ele, Speed, Course, HAcc, VAcc
+            # Auto-détection colonnes simple
             df = df.iloc[:, [0, 1, 2, 3]]
             df.columns = ['time', 'lat', 'lon', 'ele']
             
@@ -206,11 +201,102 @@ def load_gps(zip_file: zipfile.ZipFile) -> Optional[pd.DataFrame]:
     except: return None
 
 # ============================================================================
+# OPENSTREETMAP - DETECTION PISTES
+# ============================================================================
+
+def get_pistes_from_osm(session: 'Session') -> Optional[gpd.GeoDataFrame]:
+    """Récupère la liste des pistes depuis OpenStreetMap."""
+    if not HAS_GEOS: return None
+    
+    all_gps = session.get_all_gps()
+    if all_gps is None or all_gps.empty: return None
+    
+    min_lat, max_lat = all_gps['lat'].min() - 0.01, all_gps['lat'].max() + 0.01
+    min_lon, max_lon = all_gps['lon'].min() - 0.01, all_gps['lon'].max() + 0.01
+    bbox = f"{min_lat},{min_lon},{max_lat},{max_lon}"
+    
+    query = f"""
+    [out:json][timeout:25];
+    (
+      way["piste:type"="downhill"]({bbox});
+      relation["piste:type"="downhill"]({bbox});
+    );
+    out center;
+    """
+    
+    url = "https://overpass-api.de/api/interpreter"
+    
+    try:
+        with st.spinner("🗺️ Téléchargement du plan des pistes (OpenStreetMap)..."):
+            response = requests.get(url, params={'data': query}, timeout=30)
+            data = response.json()
+        
+        elements = data.get('elements', [])
+        features = []
+        
+        for elem in elements:
+            if elem['type'] == 'way':
+                coords = [[n['lon'], n['lat']] for n in elem['geometry']]
+                geom = shape({"type": "LineString", "coordinates": coords})
+            elif elem['type'] == 'relation' and 'center' in elem:
+                geom = Point(elem['center']['lon'], elem['center']['lat'])
+            else:
+                continue
+                
+            tags = elem.get('tags', {})
+            features.append({
+                'geometry': geom,
+                'name': tags.get('piste:name', tags.get('name', 'Sans nom')),
+                'difficulty': tags.get('piste:difficulty', 'unknown'),
+                'type': tags.get('piste:type', 'unknown')
+            })
+            
+        if not features:
+            return None
+            
+        gdf = gpd.GeoDataFrame(features, crs="EPSG:4326")
+        st.success(f"✅ {len(gdf)} pistes trouvées dans la zone")
+        return gdf
+        
+    except Exception as e:
+        st.error(f"Erreur OSM: {e}")
+        return None
+
+def match_gps_to_pistes(actions: List[Action], pistes_gdf: gpd.GeoDataFrame):
+    """Fait le matching spatial GPS -> Nom de piste."""
+    if pistes_gdf is None: return
+    
+    for action in actions:
+        if action.type == ActionType.RUN and action.gps_data is not None and not action.gps_data.empty:
+            
+            # Sampling pour performance
+            sample_df = action.gps_data.iloc[::10].copy()
+            geometry = [Point(xy) for xy in zip(sample_df['lon'], sample_df['lat'])]
+            run_gdf = gpd.GeoDataFrame(sample_df, geometry=geometry, crs="EPSG:4326")
+            
+            try:
+                # Jointure Nearest
+                joined = gpd.sjoin_nearest(run_gdf, pistes_gdf, distance_col="dist", max_distance=0.0005)
+                
+                if not joined.empty:
+                    valid_matches = joined[joined['dist'] < 0.0005]
+                    
+                    if not valid_matches.empty:
+                        counts = valid_matches['name'].value_counts()
+                        best_piste_name = counts.idxmax()
+                        confidence = counts.max() / len(valid_matches)
+                        
+                        if confidence > 0.4:
+                            action.track_ids = f"{best_piste_name}"
+            
+            except Exception:
+                pass
+
+# ============================================================================
 # CORE PHYSICS & BIOMECHANICS
 # ============================================================================
 
 def enrich_gps(df: pd.DataFrame) -> pd.DataFrame:
-    """Enrichit le GPS avec Vitesse, G-Forces, Pente, Virages."""
     df = df.copy()
     
     # Calculs basiques
@@ -228,7 +314,7 @@ def enrich_gps(df: pd.DataFrame) -> pd.DataFrame:
     else: df['speed_ms'] = df['speed_raw']
     df['speed_kmh'] = (df['speed_ms'] * 3.6).clip(0, 200)
     
-    # Altitude lissée & Pente
+    # Altitude & Pente
     if len(df) > 21: df['ele_smooth'] = savgol_filter(df['ele'], 21, 3)
     else: df['ele_smooth'] = df['ele']
     df['gradient'] = np.where(df['dist'] > 0.5, -(df['ele_smooth'].diff() / df['dist']) * 100, 0)
@@ -239,10 +325,7 @@ def enrich_gps(df: pd.DataFrame) -> pd.DataFrame:
     x = np.cos(lat1) * np.sin(dlon)
     y = np.cos(lat2) * np.sin(lat1) - np.sin(lat2) * np.cos(lat1) * np.cos(dlon)
     df['bearing'] = np.degrees(np.arctan2(x, y))
-    
-    # Virages (Change de bearing)
-    df['bearing_diff'] = df['bearing'].diff().fillna(0)
-    df['turn_angle'] = ((df['bearing_diff'] + 180) % 360) - 180 # Angle -180 à 180
+    df['turn_angle'] = ((df['bearing'].diff().fillna(0) + 180) % 360) - 180
     
     # Forces G
     df['accel'] = df['speed_ms'].diff() / df['dt'].replace(0, np.nan)
@@ -257,46 +340,31 @@ def enrich_gps(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def calculate_biomechanics(action: Action):
-    """Analyse l'équilibre, la symétrie et la stabilité."""
     df = action.gps_data
     if df is None or df.empty: return
-
-    # 1. Détection virages (On considère > 10 deg comme un virage effectif)
     df['is_turn'] = df['turn_angle'].abs() > 10
     turns = df[df['is_turn']]
     
-    # 2. Équilibre Gauche / Droite
-    # Negatif = Gauche, Positif = Droite
     left_turns = turns[turns['turn_angle'] < 0]
     right_turns = turns[turns['turn_angle'] > 0]
     
     action.biomechanics.left_turns_count = len(left_turns)
     action.biomechanics.right_turns_count = len(right_turns)
     
-    if not left_turns.empty:
-        action.biomechanics.avg_g_left = left_turns['g_lat'].mean()
-    if not right_turns.empty:
-        action.biomechanics.avg_g_right = right_turns['g_lat'].mean()
+    if not left_turns.empty: action.biomechanics.avg_g_left = left_turns['g_lat'].mean()
+    if not right_turns.empty: action.biomechanics.avg_g_right = right_turns['g_lat'].mean()
         
-    # 3. Score de Symétrie (Ratio des G moyens)
     if action.biomechanics.avg_g_right > 0:
         ratio = action.biomechanics.avg_g_left / action.biomechanics.avg_g_right
-        # 1.0 = Parfait. Plus on s'éloigne, plus c'est déséquilibré.
         action.biomechanics.carving_symmetry_score = 1.0 - abs(1.0 - ratio)
     
-    # 4. Indice de stabilité (Inverse de la rugosité et des changements de direction brusques)
-    # Moyenne mobile de la variation de vitesse + rugosité
     volatility = df['speed_ms'].diff().abs().mean()
     roughness = df['roughness'].mean()
     action.biomechanics.stability_index = 100 / (1 + volatility + roughness)
 
 def calculate_fatigue(runs: List[Action]):
-    """Analyse la fatigue globale sur la journée."""
     for i, run in enumerate(runs):
-        # Basé sur la dégradation de la vitesse moyenne relative et la stabilité
-        # On compare avec la moyenne des runs précédents
-        if i == 0:
-            run.fatigue_score = 0.0 # Pas de fatigue au début
+        if i == 0: run.fatigue_score = 0.0
         else:
             prev_runs = runs[:i]
             avg_prev_speed = np.mean([r.avg_speed for r in prev_runs])
@@ -304,8 +372,6 @@ def calculate_fatigue(runs: List[Action]):
             
             speed_drop = (avg_prev_speed - run.avg_speed) / avg_prev_speed if avg_prev_speed > 0 else 0
             stab_drop = (avg_prev_stab - run.biomechanics.stability_index) if avg_prev_stab > 0 else 0
-            
-            # Score de fatigue (0 = frais, 1 = épuisé)
             run.fatigue_score = np.clip((speed_drop * 2.0) + (stab_drop * 0.5), 0, 1)
 
 def enrich_actions(actions: List[Action], gps: pd.DataFrame):
@@ -322,11 +388,8 @@ def enrich_actions(actions: List[Action], gps: pd.DataFrame):
             
             gps_max_speed = df['speed_kmh'].max()
             if 0 < gps_max_speed < 200: action.top_speed = gps_max_speed
-            
-            # Calculs Biomécaniques
             calculate_biomechanics(action)
             
-    # Calcul de la fatigue après avoir rempli toutes les actions
     runs = [a for a in actions if a.type == ActionType.RUN]
     calculate_fatigue(runs)
 
@@ -344,7 +407,6 @@ class Session:
     @property
     def stats(self):
         ski_hours = sum(r.duration for r in self.runs) / 3600
-        # Calcul de la météo en string
         w = self.activity.weather
         w_str = f"{w.temp_avg}°C, {w.condition}" if w else "N/A"
         
@@ -362,10 +424,7 @@ class Session:
         return pd.concat([r.gps_data for r in self.runs if r.gps_data is not None])
 
 # ============================================================================
-# VISUALIZATION FUNCTIONS
-# ============================================================================
-# ============================================================================
-# CORRECTION VISUALISATIONS PYDECK
+# VISUALIZATION FUNCTIONS (FIXED)
 # ============================================================================
 
 def create_replay_map(session: Session, selected_run_idx: int, time_idx: int):
@@ -375,156 +434,63 @@ def create_replay_map(session: Session, selected_run_idx: int, time_idx: int):
     
     if df is None or df.empty: return None
 
-    # 1. Tracé complet de la piste
-    # IMPORTANT: On filtre pour ne garder que lat/lon pour éviter l'erreur de sérialisation
-    # des timestamps ou autres colonnes complexes.
+    # 1. Tracé complet
     path_data = df[['lon', 'lat']].copy()
-    
     path_layer = pdk.Layer(
-        "PathLayer",
-        data=path_data,
-        get_path="[['lon', 'lat']]", # Note: On utilise les noms de colonnes
-        get_color=[255, 255, 255, 100],
-        width_min_pixels=6,
-        pickable=False
+        "PathLayer", data=path_data, get_path="[['lon', 'lat']]",
+        get_color=[255,255,255,100], width_min_pixels=6, pickable=False
     )
     
-    # 2. Position actuelle (Le "Skieur")
-    # On extrait la ligne et on la convertit explicitement en DataFrame (1 ligne)
-    # On ajoute 'bearing' pour l'orientation de la caméra
+    # 2. Position actuelle (Skieur)
     current_pos = df.iloc[time_idx]
     skier_data = pd.DataFrame([{
-        "lon": current_pos['lon'],
-        "lat": current_pos['lat'],
-        "bearing": current_pos['bearing']
+        "lon": current_pos['lon'], "lat": current_pos['lat'], "bearing": current_pos['bearing']
     }])
     
     skier_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=skier_data, # On passe un DataFrame propre
-        get_position=["lon", "lat"],
-        get_color=[255, 0, 0],
-        get_radius=10,
-        pickable=False
+        "ScatterplotLayer", data=skier_data, get_position=["lon", "lat"],
+        get_color=[255,0,0], get_radius=10, pickable=False
     )
     
-    # 3. Vue subjective (FPV)
-    # On centre la caméra sur la position actuelle
+    # 3. Vue subjective
     view_state = pdk.ViewState(
-        latitude=current_pos['lat'],
-        longitude=current_pos['lon'],
-        zoom=16,
-        pitch=60,
-        bearing=current_pos['bearing']
+        latitude=current_pos['lat'], longitude=current_pos['lon'],
+        zoom=16, pitch=60, bearing=current_pos['bearing']
     )
     
     return pdk.Deck(layers=[path_layer, skier_layer], initial_view_state=view_state, map_style="mapbox://styles/mapbox/outdoors-v11")
 
 def create_heatmap(session: Session, mode: str):
-    """Crée une carte thermique (Density, Speed, G-Force)."""
+    """Crée une carte thermique."""
     full_df = session.get_all_gps()
-    
     if full_df is None or full_df.empty: return None
     
-    # Filtrage des données pour ne garder que ce dont PyDeck a besoin
-    # Cela résout les erreurs de sérialisation
     df = full_df[['lon', 'lat']].copy()
     
     if mode == "Density":
-        layer = pdk.Layer(
-            "HeatmapLayer",
-            data=df,
-            get_position=["lon", "lat"],
-            radius=50,
-            opacity=0.8
-        )
+        layer = pdk.Layer("HeatmapLayer", data=df, get_position=["lon", "lat"], radius=50, opacity=0.8)
     elif mode == "Speed":
-        # Ajout de la colonne vitesse pour le mapping couleur
         df['speed_kmh'] = full_df['speed_kmh'].values
-        layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=df,
-            get_position=["lon", "lat"],
-            get_color="[255 * (speed_kmh / 100), 0, 255 * (1 - speed_kmh/100), 150]",
-            get_radius=20,
-            pickable=True
-        )
+        layer = pdk.Layer("ScatterplotLayer", data=df, get_position=["lon", "lat"], get_color="[255 * (speed_kmh / 100), 0, 255 * (1 - speed_kmh/100), 150]", get_radius=20)
     elif mode == "G-Lat":
-        # Ajout de la colonne G-Lat
         df['g_lat'] = full_df['g_lat'].values
-        layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=df,
-            get_position=["lon", "lat"],
-            get_color="[255 * (g_lat/2), 255 * (1 - g_lat/2), 0, 150]",
-            get_radius=20
-        )
+        layer = pdk.Layer("ScatterplotLayer", data=df, get_position=["lon", "lat"], get_color="[255 * (g_lat/2), 255 * (1 - g_lat/2), 0, 150]", get_radius=20)
     
-    view = pdk.ViewState(
-        latitude=df['lat'].mean(), 
-        longitude=df['lon'].mean(), 
-        zoom=13, pitch=30
-    )
-    
+    view = pdk.ViewState(latitude=df['lat'].mean(), longitude=df['lon'].mean(), zoom=13, pitch=30)
     return pdk.Deck(layers=[layer], initial_view_state=view)
 
 def plot_biomechanics(session: Session, run_idx: int):
-    """Graphiques Plotly pour l'analyse biomécanique."""
     run = session.runs[run_idx]
-    df = run.gps_data
-    
     fig = go.Figure()
-    
-    # Virages à Gauche vs Droite
-    fig.add_trace(go.Bar(
-        x=["Gauche", "Droite"],
-        y=[run.biomechanics.left_turns_count, run.biomechanics.right_turns_count],
-        name="Nombre de virages",
-        marker_color=['#3498db', '#e74c3c']
-    ))
-    
-    fig.update_layout(
-        title=f"Équilibre Virages - Run #{run.number}",
-        yaxis_title="Nombre",
-        template='plotly_white',
-        height=400
-    )
+    fig.add_trace(go.Bar(x=["Gauche", "Droite"], y=[run.biomechanics.left_turns_count, run.biomechanics.right_turns_count], marker_color=['#3498db', '#e74c3c']))
+    fig.update_layout(title=f"Équilibre Virages - Run #{run.number}", template='plotly_white', height=400)
     return fig
 
 def plot_fatigue_curve(session: Session):
-    """Courbe de fatigue sur la journée."""
     runs = session.runs
-    run_numbers = [r.number for r in runs]
-    fatigue_scores = [r.fatigue_score * 100 for r in runs] # En pourcentage
-    
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=run_numbers,
-        y=fatigue_scores,
-        mode='lines+markers',
-        name="Indice de Fatigue",
-        line=dict(color='#e67e22', width=3)
-    ))
-    
-    # Ajouter une tendance linéaire
-    if len(run_numbers) > 1:
-        z = np.polyfit(run_numbers, fatigue_scores, 1)
-        p = np.poly1d(z)
-        fig.add_trace(go.Scatter(
-            x=run_numbers,
-            y=p(run_numbers),
-            mode='lines',
-            name="Tendance",
-            line=dict(color='gray', dash='dash')
-        ))
-
-    fig.update_layout(
-        title="Évolution de la Fatigue (Journée)",
-        xaxis_title="Run #",
-        yaxis_title="Fatigue (%)",
-        template='plotly_white',
-        height=400
-    )
+    fig.add_trace(go.Scatter(x=[r.number for r in runs], y=[r.fatigue_score*100 for r in runs], mode='lines+markers', name="Fatigue %", line=dict(color='#e67e22', width=3)))
+    fig.update_layout(title="Évolution de la Fatigue", xaxis_title="Run #", yaxis_title="Fatigue (%)", template='plotly_white', height=400)
     return fig
 
 # ============================================================================
@@ -534,7 +500,6 @@ def plot_fatigue_curve(session: Session):
 def main():
     st.title("🎿 Ski Analytics Pro - Ultimate Edition")
     
-    # --- SIDEBAR ---
     with st.sidebar:
         st.header("⚙️ Configuration")
         uploaded = st.file_uploader("Chargez fichier .slopes", type=['slopes'])
@@ -548,7 +513,7 @@ def main():
         return
     
     # --- LOADING & PROCESSING ---
-    with st.spinner("Deep Analyse en cours (Météo, Physique, Biomécanique)..."):
+    with st.spinner("Deep Analyse en cours (Météo, OSM, Physique, Biomécanique)..."):
         with zipfile.ZipFile(uploaded) as zf:
             activity, actions = parse_metadata(zf)
             gps_data = load_gps(zf)
@@ -562,6 +527,11 @@ def main():
                 enrich_actions(actions, gps_data)
             
             session = Session(activity, actions, weight)
+
+            # --- DÉTECTION AUTOMATIQUE DES PISTES (NOUVEAU) ---
+            pistes_gdf = get_pistes_from_osm(session)
+            if pistes_gdf is not None:
+                match_gps_to_pistes(actions, pistes_gdf)
 
     # --- DASHBOARD HEADER ---
     st.subheader(f"Session : {session.activity.location} | {session.stats['weather']}")
@@ -581,10 +551,9 @@ def main():
     with tab_overview:
         col1, col2 = st.columns(2)
         
-        # Tableau des pistes
         df_runs = pd.DataFrame([{
             "N°": r.number,
-            "Piste": r.track_ids[:15]+"...", # Tronqué
+            "Piste": r.track_ids[:20] + ("..." if len(r.track_ids)>20 else ""), # Tronqué pour affichage
             "Diff": r.difficulty.label,
             "V.Moy": f"{r.avg_speed:.1f}",
             "Pente": f"{r.avg_gradient:.1f}%",
@@ -594,79 +563,52 @@ def main():
         
         col1.dataframe(df_runs, use_container_width=True)
         
-        # Graphiques de base
         with col2:
-            # Distribution des difficultés
-            fig_diff = px.histogram(
-                df_runs, x="Diff", color="Diff",
-                title="Répartition des Difficultés",
-                color_discrete_map={d.label: d.color for d in Difficulty}
-            )
+            fig_diff = px.histogram(df_runs, x="Diff", color="Diff", title="Répartition des Difficultés", color_discrete_map={d.label: d.color for d in Difficulty})
             st.plotly_chart(fig_diff, use_container_width=True)
 
-    # --- TAB 2: REPLAY 3D (NOUVEAU) ---
+    # --- TAB 2: REPLAY 3D ---
     with tab_replay:
-        st.info("🎥 Mode Replay : Utilisez le curseur pour rejouer la descente. La carte pivote pour suivre le skieur (Vue Subjective).")
+        st.info("🎥 Mode Replay : Utilisez le curseur pour rejouer la descente.")
         
-        run_options = [f"Run #{r.number} - {r.difficulty.label}" for r in session.runs]
+        run_options = [f"Run #{r.number} - {r.track_ids[:20]}" for r in session.runs]
         selected_run_name = st.selectbox("Choisir la descente à rejouer", run_options)
         run_idx = run_options.index(selected_run_name)
         
         run = session.runs[run_idx]
         
-        # Slider temporel (Downsampling pour fluidité)
         df = run.gps_data
         if not df.empty:
-            # On prend un point sur 5 pour que le slider ne soit pas trop lourd
             steps = range(0, len(df), 5)
             time_idx = st.slider("Timeline", 0, len(steps)-1, 0)
-            
-            # Récupérer l'index réel dans le dataframe
             real_idx = steps[time_idx]
             
-            # Info dynamique
             current_point = df.iloc[real_idx]
             c1, c2, c3 = st.columns(3)
             c1.metric("Vitesse Actuelle", f"{current_point['speed_kmh']:.1f} km/h")
             c2.metric("Altitude", f"{current_point['ele']:.0f} m")
             c3.metric("Cap", f"{current_point['bearing']:.0f}°")
             
-            # Affichage Carte
             st.pydeck_chart(create_replay_map(session, run_idx, real_idx), use_container_width=True)
 
-    # --- TAB 3: BIOMÉCANIQUE (NOUVEAU) ---
+    # --- TAB 3: BIOMÉCANIQUE ---
     with tab_biomech:
         st.subheader("Analyse Technique & Physiologique")
-        
-        # Sélection run
         selected_run_name_bio = st.selectbox("Analyser Run", run_options, key="bio")
         run_idx_bio = run_options.index(selected_run_name_bio)
         
         col1, col2 = st.columns(2)
-        
         with col1:
-            # Équilibre G/D
             st.plotly_chart(plot_biomechanics(session, run_idx_bio), use_container_width=True)
-            
-            # Métriques clés
             r = session.runs[run_idx_bio]
             st.write("**Détail Run :**")
-            st.json({
-                "Virages Gauche": r.biomechanics.left_turns_count,
-                "Virages Droite": r.biomechanics.right_turns_count,
-                "Symétrie": f"{r.biomechanics.carving_symmetry_score:.2f}",
-                "Stabilité": f"{r.biomechanics.stability_index:.2f}"
-            })
-
+            st.json({"Virages Gauche": r.biomechanics.left_turns_count, "Virages Droite": r.biomechanics.right_turns_count, "Symétrie": f"{r.biomechanics.carving_symmetry_score:.2f}", "Stabilité": f"{r.biomechanics.stability_index:.2f}"})
         with col2:
-            # Courbe Fatigue Globale
             st.plotly_chart(plot_fatigue_curve(session), use_container_width=True)
-            st.caption("Indique si le skieur perd en vitesse ou en stabilité en fin de journée.")
 
-    # --- TAB 4: HEATMAPS (NOUVEAU) ---
+    # --- TAB 4: HEATMAPS ---
     with tab_heatmaps:
         st.subheader("Cartographie Thermique")
-        
         mode = st.radio("Type de Heatmap", ["Density (Fréquentation)", "Speed (Vitesse)", "G-Lat (Virages Techniques)"])
         
         map_mode = "Density"
