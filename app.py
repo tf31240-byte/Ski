@@ -13,7 +13,7 @@ from dateutil import parser as date_parser
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="Ski Analytics Pro - Universal Slope Edition", 
+    page_title="Ski Analytics Pro - Stable Edition", 
     layout="wide", 
     page_icon="🏔️",
     initial_sidebar_state="expanded"
@@ -98,7 +98,6 @@ def parse_slope_metadata(zip_file):
             root = tree.getroot()
             
             segments = []
-            # Recherche robuste des tags Action
             for action in root.findall('.//Action'):
                 action_type = action.get('type')
                 start_str = action.get('start')
@@ -127,17 +126,13 @@ def parse_slope_metadata(zip_file):
         return None
 
 def identify_gps_columns(df_raw):
-    """
-    Détecte intelligemment les colonnes Time, Lat, Lon, Alt.
-    Fonctionne maintenant que les colonnes sont correctement séparées.
-    """
-    st.text("🔍 Identification des colonnes GPS en cours...")
+    """Détecte intelligemment les colonnes Time, Lat, Lon, Alt."""
+    st.text("🔍 Analyse de la structure du CSV en cours...")
     
     if df_raw.empty:
         st.error("Le fichier CSV est vide.")
         return None
 
-    # On cherche la première ligne avec des données numériques cohérentes
     sample_row = None
     for i in range(min(10, len(df_raw))):
         row_vals = df_raw.iloc[i].values
@@ -148,7 +143,6 @@ def identify_gps_columns(df_raw):
                 valid_floats += 1
             except:
                 pass
-        # Si on a au moins 3 nombres valides, c'est une ligne de données
         if valid_floats >= 3:
             sample_row = row_vals
             break
@@ -160,7 +154,6 @@ def identify_gps_columns(df_raw):
 
     mapping = {'time': None, 'lat': None, 'lon': None, 'ele': None}
     
-    # Heuristiques
     for idx, val in enumerate(sample_row):
         try:
             num_val = float(val)
@@ -168,7 +161,7 @@ def identify_gps_columns(df_raw):
             continue 
             
         if mapping['time'] is None:
-            if num_val > 1_000_000_000: # Timestamp Unix
+            if num_val > 1_000_000_000: 
                 mapping['time'] = idx
                 
         if mapping['lat'] is None:
@@ -187,7 +180,9 @@ def identify_gps_columns(df_raw):
         st.text(f"Colonnes identifiées -> Time:{mapping['time']}, Lat:{mapping['lat']}, Lon:{mapping['lon']}, Alt:{mapping['ele']}")
         return [mapping['time'], mapping['lat'], mapping['lon'], mapping['ele']]
     else:
-        st.error("Échec de l'identification automatique.")
+        st.error("Échec de l'identification automatique des colonnes GPS.")
+        st.write("Valeurs trouvées :")
+        st.write(mapping)
         return None
 
 def load_slope_file(uploaded_file):
@@ -215,15 +210,13 @@ def load_slope_file(uploaded_file):
                         break
 
             if not target_csv:
-                st.error("Aucun fichier GPS (GPS.csv ou RawGPS.csv) trouvé.")
+                st.error("Aucun fichier GPS (GPS.csv ou RawGPS.csv) trouvé dans l'archive.")
                 return None, None
 
             st.text(f"Fichier trouvé : {target_csv}")
 
             with z.open(target_csv) as f:
-                # --- LE CORRECTIF ICI ---
-                # On utilise une Regex pour accepter Pipe, Virgule OU Tabulation comme séparateur.
-                # Cela gère les formats : "0 | 1 | 2" ET "0 \t 1,2,3,4"
+                # Regex pour accepter Pipe, Virgule OU Tabulation
                 df_raw = pd.read_csv(f, sep=r'[|,\t]', engine='python', header=None, on_bad_lines='skip')
                 
                 if df_raw.empty:
@@ -241,7 +234,6 @@ def load_slope_file(uploaded_file):
                 
                 idx_time, idx_lat, idx_lon, idx_ele = indices
                 
-                # Vérification bounds
                 max_idx = max(indices)
                 if max_idx >= len(df_raw.columns):
                     st.error(f"Erreur critique : Index de colonne {max_idx} supérieur au nombre de colonnes ({len(df_raw.columns)})")
@@ -317,6 +309,7 @@ class SkiRun:
 
     def get_metrics(self):
         return {
+            "N°": self.id,
             "Durée": f"{int(self.duration_sec//60)}:{int(self.duration_sec%60):02d}",
             "Distance": f"{int(self.distance_m)} m",
             "Dénivelé": f"{int(self.drop_m)} m",
@@ -324,7 +317,9 @@ class SkiRun:
             "Vitesse Moy": f"{self.avg_speed:.1f} km/h",
             "G Lat Max": f"{self.max_g_lat:.2f} G",
             "Rugosité Max": f"{self.max_rugosity:.2f}",
-            "Carving": f"{self.avg_turn_angle:.0f}°"
+            "Carving": f"{self.avg_turn_angle:.0f}°",
+            "Couleur": self.color,
+            "Heure": self.start_time.strftime('%H:%M') if self.start_time else "-"
         }
 
 class SkiSession:
@@ -540,6 +535,7 @@ def main():
             st.success(f"Session analysée : {len(session.runs)} descentes détectées.")
             stats = session.get_global_stats()
 
+            # --- REPLAY / SLIDER ---
             st.sidebar.subheader("⏱️ Replay Temporel")
             min_time = session.df['time'].min().to_pydatetime()
             max_time = session.df['time'].max().to_pydatetime()
@@ -595,29 +591,26 @@ def main():
                 run_data = []
                 for run in session.runs:
                     m = run.get_metrics()
-                    run_data.append({
-                        "N°": run.id, 
-                        "Heure": run.start_time.strftime('%H:%M') if run.start_time else "-",
-                        "Couleur": run.color, 
-                        "Durée": m["Durée"], 
-                        "Dist (m)": int(run.distance_m),
-                        "VMax (km/h)": int(run.max_speed),
-                        "G Lat Max": m["G Lat Max"],
-                        "Rugosité Max": m["Rugosité Max"]
-                    })
+                    run_data.append(m)
+                
                 df_runs = pd.DataFrame(run_data)
-                st.dataframe(df_runs, use_container_width=True)
                 
-                selected_run_id = st.selectbox("Choisir une descente", df_runs['N°'])
-                run_obj = next((r for r in session.runs if r.id == selected_run_id), None)
-                
-                if run_obj:
-                    col1, col2 = st.columns(2)
-                    col1.info(f"**Couleur :** {run_obj.color}\n**Carving :** {run_obj.avg_turn_angle:.0f}° moyen.")
-                    col2.metric("Vitesse Max", f"{run_obj.max_speed:.1f} km/h")
-                    col2.metric("G Lat Max", f"{run_obj.max_g_lat:.2f} G")
-                    fig_detail = px.line(run_obj.df, x='time', y='speed_kmh', title=f"Vitesse Descente #{run_obj.id}")
-                    st.plotly_chart(fig_detail, use_container_width=True)
+                # Correction Sécurité : Vérification avant affichage
+                if not df_runs.empty:
+                    st.dataframe(df_runs, use_container_width=True)
+                    
+                    selected_run_id = st.selectbox("Choisir une descente", df_runs['N°'])
+                    run_obj = next((r for r in session.runs if r.id == selected_run_id), None)
+                    
+                    if run_obj:
+                        col1, col2 = st.columns(2)
+                        col1.info(f"**Couleur :** {run_obj.color}\n**Carving :** {run_obj.avg_turn_angle:.0f}° moyen.")
+                        col2.metric("Vitesse Max", f"{run_obj.max_speed:.1f} km/h")
+                        col2.metric("G Lat Max", f"{run_obj.max_g_lat:.2f} G")
+                        fig_detail = px.line(run_obj.df, x='time', y='speed_kmh', title=f"Vitesse Descente #{run_obj.id}")
+                        st.plotly_chart(fig_detail, use_container_width=True)
+                else:
+                    st.warning("Aucune descente détectée pour afficher les détails.")
 
             with tab3:
                 st.header("Physique & Technique")
@@ -636,7 +629,7 @@ def main():
             st.error("Une erreur critique est survenue.")
             st.exception(e)
     else:
-        st.title("Ski Analytics Pro - Slopes Edition")
+        st.title("Ski Analytics Pro - Stable Edition")
         st.info("Veuillez charger un fichier .slopes.")
 
 if __name__ == "__main__":
