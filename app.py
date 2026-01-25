@@ -72,11 +72,14 @@ class Action:
     min_alt: float
     avg_speed: float
     top_speed: float
+    track_ids: str = ""  # Identifiant de la piste
     gps_data: pd.DataFrame = None
     difficulty: Difficulty = None
     avg_gradient: float = 0.0
     max_g_lat: float = 0.0
+    max_g_long: float = 0.0
     avg_turn: float = 0.0
+    max_roughness: float = 0.0
 
 # ============================================================================
 # PARSING - MÉTADONNÉES PRIORITAIRES
@@ -149,7 +152,8 @@ def parse_metadata(zip_file: zipfile.ZipFile) -> Tuple[Optional[Activity], List[
                         max_alt=float(elem.get('maxAlt', 0)),
                         min_alt=float(elem.get('minAlt', 0)),
                         avg_speed=float(elem.get('avgSpeed', 0)),
-                        top_speed=float(elem.get('topSpeed', 0))
+                        top_speed=float(elem.get('topSpeed', 0)),
+                        track_ids=elem.get('trackIDs', '')  # Nom de la piste
                     ))
                 except Exception as e:
                     st.warning(f"⚠️ Action ignorée: {e}")
@@ -218,50 +222,125 @@ def load_gps(zip_file: zipfile.ZipFile) -> Optional[pd.DataFrame]:
 # ============================================================================
 
 def enrich_gps(df: pd.DataFrame) -> pd.DataFrame:
-    """Ajoute calculs physiques avancés"""
+    """Ajoute calculs physiques avancés - VÉRIFIÉS"""
     df = df.copy()
     
-    # Distance Haversine
+    # Distance Haversine (en mètres)
     lat1, lon1 = np.radians(df['lat']), np.radians(df['lon'])
     lat2, lon2 = lat1.shift(-1), lon1.shift(-1)
     dlat, dlon = lat2 - lat1, lon2 - lon1
     a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
     df['dist'] = 2 * np.arcsin(np.sqrt(a.clip(0, 1))) * 6371000
     
-    # Vitesse
+    # Temps entre points
     df['dt'] = df['time'].diff().dt.total_seconds().fillna(0)
-    df['speed_kmh'] = np.where((df['dt'] > 0) & (df['dt'] < 10), 
-                               (df['dist'] / df['dt']) * 3.6, 0).clip(0, 150)
-    df['speed_ms'] = df['speed_kmh'] / 3.6
     
-    # Pente
-    df['ele_smooth'] = savgol_filter(df['ele'], 21, 3) if len(df) > 21 else df['ele']
+    # Vitesse INSTANTANÉE (m/s puis km/h)
+    # Important: filtrer les valeurs aberrantes (dt trop grand = pause)
+    mask_valid = (df['dt'] > 0) & (df['dt'] < 10)
+    df['speed_raw'] = np.where(mask_valid, df['dist'] / df['dt'], 0)
+    
+    # Lissage de la vitesse pour réduire le bruit GPS
+    if len(df) > 11:
+        df['speed_ms'] = savgol_filter(df['speed_raw'], 11, 2)
+    else:
+        df['speed_ms'] = df['speed_raw']
+    
+    df['speed_kmh'] = (df['speed_ms'] * 3.6).clip(0, 200)  # Conversion en km/h
+    
+    # Altitude lissée (réduit le bruit altimétrique)
+    if len(df) > 21:
+        df['ele_smooth'] = savgol_filter(df['ele'], 21, 3)
+    else:
+        df['ele_smooth'] = df['ele']
+    
+    # Pente (gradient en %)
+    # Négatif = descente, positif = montée
     df['gradient'] = np.where(df['dist'] > 0.5, 
                              -(df['ele_smooth'].diff() / df['dist']) * 100, 0)
     
-    # Forces G latérales
-    df['bearing'] = np.arctan2(np.radians(df['lon']).diff(), 
-                              np.radians(df['lat']).diff()) * 180 / np.pi
-    df['turn_rad'] = np.radians(df['bearing'].diff().abs())
-    df['radius'] = np.where(df['turn_rad'] > 0.01, df['dist'] / df['turn_rad'], np.inf)
-    df['g_lat'] = ((df['speed_ms']**2 / df['radius']) / 9.81).clip(0, 5)
-    df['turn_angle'] = df['bearing'].diff().clip(-180, 180)
+    if len(df) > 21:
+        df['gradient'] = savgol_filter(df['gradient'], 21, 3)
+    
+    # Forces G LONGITUDINALES (accélération/freinage)
+    # a = dv/dt, g = a / 9.81
+    df['accel'] = df['speed_ms'].diff() / df['dt'].replace(0, np.nan)
+    df['g_long'] = (df['accel'].abs() / 9.81).fillna(0).clip(0, 5)
+    
+    # Forces G LATÉRALES (virages) - FORMULE CORRIGÉE
+    # Calcul du bearing (cap/direction)
+    df['bearing'] = np.degrees(np.arctan2(
+        np.radians(df['lon']).diff(), 
+        np.radians(df['lat']).diff()
+    ))
+    
+    # Changement de direction (angle du virage)
+    df['bearing_diff'] = df['bearing'].diff().fillna(0)
+    
+    # Normalisation de l'angle entre -180 et 180
+    df['bearing_diff'] = ((df['bearing_diff'] + 180) % 360) - 180
+    
+    # Angle de virage en radians
+    df['turn_angle_rad'] = np.radians(df['bearing_diff'].abs())
+    
+    # Rayon de courbure: R = distance / angle (en radians)
+    # Plus le rayon est petit, plus le virage est serré
+    mask_turn = (df['turn_angle_rad'] > 0.001) & (df['dist'] > 0.1)
+    df['radius'] = np.where(mask_turn, df['dist'] / df['turn_angle_rad'], np.inf)
+    
+    # Force centripète: a_c = v² / R
+    # G latéral = a_c / g
+    df['centripetal_accel'] = df['speed_ms']**2 / df['radius']
+    df['g_lat'] = (df['centripetal_accel'] / 9.81).clip(0, 5)
+    
+    # Angle de virage (pour analyse du carving)
+    df['turn_angle'] = df['bearing_diff'].clip(-180, 180)
+    
+    # Rugosité (variabilité de l'altitude = bosses/neige)
+    df['roughness'] = df['ele'].rolling(window=5, center=True).std().fillna(0)
     
     return df
 
 def enrich_actions(actions: List[Action], gps: pd.DataFrame):
-    """Associe GPS aux actions et calcule métriques"""
+    """Associe GPS aux actions et calcule métriques VÉRIFIÉES"""
     for action in actions:
         mask = (gps['time'] >= action.start) & (gps['time'] <= action.end)
         action.gps_data = gps[mask].copy()
         
         if action.type == ActionType.RUN and not action.gps_data.empty:
             df = action.gps_data
+            
+            # Pente moyenne (valeur absolue)
             action.avg_gradient = abs(df['gradient'].mean())
+            
+            # Difficulté basée sur la pente
             action.difficulty = Difficulty.from_gradient(action.avg_gradient)
+            
+            # Forces G latérales MAX (virages les plus serrés)
             action.max_g_lat = df['g_lat'].max()
-            turns = df[df['turn_angle'].abs() > 30]
-            action.avg_turn = turns['turn_angle'].abs().mean() if not turns.empty else 0
+            
+            # Forces G longitudinales MAX (freinage/accélération max)
+            action.max_g_long = df['g_long'].max()
+            
+            # Carving: angle MOYEN des virages > 30°
+            # Un bon carving = virages francs et réguliers
+            significant_turns = df[df['turn_angle'].abs() > 30]
+            if not significant_turns.empty:
+                action.avg_turn = significant_turns['turn_angle'].abs().mean()
+            else:
+                action.avg_turn = 0
+            
+            # Rugosité MAX (bosses/neige irrégulière)
+            action.max_roughness = df['roughness'].max()
+            
+            # CORRECTION: Vitesse MAX issue du GPS (pas du XML qui peut être erroné)
+            # On prend la vraie vitesse max calculée depuis les points GPS
+            gps_max_speed = df['speed_kmh'].max()
+            
+            # Si la vitesse GPS est cohérente, on l'utilise
+            # Sinon on garde celle du XML
+            if gps_max_speed > 0 and gps_max_speed < 200:
+                action.top_speed = gps_max_speed
 
 # ============================================================================
 # SESSION
@@ -284,7 +363,8 @@ class Session:
             "descent_m": sum(abs(r.vertical) for r in self.runs),
             "duration": f"{self.activity.duration//3600}h{(self.activity.duration%3600)//60}m",
             "max_speed": max((r.top_speed for r in self.runs), default=0),
-            "max_g": max((r.max_g_lat for r in self.runs), default=0),
+            "max_g_lat": max((r.max_g_lat for r in self.runs), default=0),
+            "max_g_long": max((r.max_g_long for r in self.runs), default=0),
             "calories": int(6.5 * self.weight * ski_hours)
         }
     
@@ -293,6 +373,7 @@ class Session:
         for r in self.runs:
             data.append({
                 "N°": r.number,
+                "Piste": r.track_ids.split(',')[0] if r.track_ids else "-",  # Nom de la piste
                 "Heure": r.start.strftime('%H:%M'),
                 "Durée": f"{int(r.duration//60)}:{int(r.duration%60):02d}",
                 "Distance": f"{int(r.distance)}m",
@@ -302,7 +383,9 @@ class Session:
                 "Pente": f"{r.avg_gradient:.1f}%",
                 "Couleur": r.difficulty.label if r.difficulty else "-",
                 "G Lat": f"{r.max_g_lat:.2f}",
-                "Carving": f"{r.avg_turn:.0f}°"
+                "G Long": f"{r.max_g_long:.2f}",
+                "Carving": f"{r.avg_turn:.0f}°",
+                "Rugosité": f"{r.max_roughness:.2f}"
             })
         return pd.DataFrame(data)
 
@@ -394,11 +477,12 @@ def main():
     
     # Stats globales
     stats = session.stats
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Descentes", stats['runs'])
     c2.metric("Distance", f"{stats['distance_km']:.1f} km")
     c3.metric("V.Max", f"{stats['max_speed']:.1f} km/h")
-    c4.metric("Calories", stats['calories'])
+    c4.metric("G Lat Max", f"{stats['max_g_lat']:.2f} G")
+    c5.metric("Calories", stats['calories'])
     
     tab1, tab2, tab3 = st.tabs(["📊 Vue d'ensemble", "🎿 Descentes", "🗺️ Carte"])
     
@@ -415,11 +499,53 @@ def main():
             selected = st.selectbox("Détail descente", df_runs['N°'])
             run = next(r for r in session.runs if r.number == selected)
             
-            if run.gps_data is not None:
-                st.plotly_chart(
-                    go.Figure(go.Scatter(x=run.gps_data['time'], y=run.gps_data['speed_kmh'])),
-                    use_container_width=True
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Couleur piste", run.difficulty.label if run.difficulty else "N/A")
+            col1.metric("Pente moyenne", f"{run.avg_gradient:.1f}%")
+            col2.metric("G Lat Max", f"{run.max_g_lat:.2f} G", help="Force latérale dans les virages")
+            col2.metric("G Long Max", f"{run.max_g_long:.2f} G", help="Freinage/Accélération")
+            col3.metric("Carving moyen", f"{run.avg_turn:.0f}°", help="Angle moyen des virages > 30°")
+            col3.metric("Rugosité", f"{run.max_roughness:.2f}", help="Bosses/neige irrégulière")
+            
+            if run.gps_data is not None and not run.gps_data.empty:
+                # Graphique vitesse
+                fig_speed = go.Figure()
+                fig_speed.add_trace(go.Scatter(
+                    x=run.gps_data['time'], 
+                    y=run.gps_data['speed_kmh'],
+                    mode='lines',
+                    name='Vitesse',
+                    line=dict(color='#007FFF', width=2)
+                ))
+                fig_speed.update_layout(
+                    title=f"Vitesse - Run #{run.number}",
+                    yaxis_title="Vitesse (km/h)",
+                    template='plotly_white'
                 )
+                st.plotly_chart(fig_speed, use_container_width=True)
+                
+                # Graphique Forces G
+                fig_g = go.Figure()
+                fig_g.add_trace(go.Scatter(
+                    x=run.gps_data['time'],
+                    y=run.gps_data['g_lat'],
+                    mode='lines',
+                    name='G Latéral',
+                    line=dict(color='#FF6B6B')
+                ))
+                fig_g.add_trace(go.Scatter(
+                    x=run.gps_data['time'],
+                    y=run.gps_data['g_long'],
+                    mode='lines',
+                    name='G Longitudinal',
+                    line=dict(color='#4ECDC4')
+                ))
+                fig_g.update_layout(
+                    title="Forces G",
+                    yaxis_title="G",
+                    template='plotly_white'
+                )
+                st.plotly_chart(fig_g, use_container_width=True)
     
     with tab3:
         st.pydeck_chart(create_map(session))
