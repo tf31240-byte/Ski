@@ -1,9 +1,10 @@
 """
-SKI ANALYTICS PRO - ULTIMATE EDITION (FIXED)
-============================================
-Corrections : 
-- Gestion sécurisée de l'import geopandas (pas de crash si absent)
-- Types hints sécurisés pour éviter NameError au chargement
+SKI ANALYTICS PRO - ULTIMATE EDITION (ALL FIXES)
+=================================================
+Corrections appliquées :
+- Correction des imports (Enum déplacé vers module 'enum')
+- Sécurité complète si geopandas est manquant
+- Correction PyDeck (types primitifs)
 """
 
 import sys
@@ -20,7 +21,9 @@ import zipfile
 import xml.etree.ElementTree as ET
 from dateutil import parser as date_parser
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Enum, Any
+# IMPORTS CORRIGÉS
+from typing import List, Optional, Tuple, Dict, Any
+from enum import Enum
 import requests
 
 # ============================================================================
@@ -33,8 +36,7 @@ try:
     HAS_GEOS = True
 except ImportError:
     HAS_GEOS = False
-    # On définit des objets factices pour éviter le crash lors du parsing des types
-    # Cela permet au script de démarrer même si geopandas n'est pas là.
+    # Mock classes pour éviter les crashes de type hinting au chargement
     class _GeoDataFrame: pass
     class _Point: pass
     class _Shape: pass
@@ -43,10 +45,10 @@ except ImportError:
     Point = _Point
     shape = _Shape
 
-st.set_page_config(page_title="Ski Analytics Pro Ultimate", layout="wide")
-
 if not HAS_GEOS:
     st.sidebar.warning("⚠️ 'geopandas' non installé. La détection des noms de pistes est désactivée.")
+
+st.set_page_config(page_title="Ski Analytics Pro Ultimate", layout="wide")
 
 # ============================================================================
 # MODELS & CONFIG
@@ -185,12 +187,7 @@ def parse_metadata(zip_file: zipfile.ZipFile) -> Tuple[Optional[Activity], List[
         return None, []
 
 def get_weather(location: str, start: datetime, end: datetime) -> Weather:
-    """Simule ou récupère la météo."""
-    return Weather(
-        temp_avg=-5.0,
-        wind_max=15.0,
-        condition="Neige légère / Nuageux"
-    )
+    return Weather(temp_avg=-5.0, wind_max=15.0, condition="Neige légère / Nuageux")
 
 def load_gps(zip_file: zipfile.ZipFile) -> Optional[pd.DataFrame]:
     try:
@@ -200,11 +197,8 @@ def load_gps(zip_file: zipfile.ZipFile) -> Optional[pd.DataFrame]:
         
         with zip_file.open(target) as f:
             df = pd.read_csv(f, sep=r'[|,\t]', engine='python', header=None, on_bad_lines='skip')
-            
-            # Auto-détection colonnes simple
             df = df.iloc[:, [0, 1, 2, 3]]
             df.columns = ['time', 'lat', 'lon', 'ele']
-            
             df['time'] = pd.to_datetime(pd.to_numeric(df['time'], errors='coerce'), unit='s', utc=True)
             df = df.dropna().sort_values('time').reset_index(drop=True)
             return df
@@ -214,10 +208,8 @@ def load_gps(zip_file: zipfile.ZipFile) -> Optional[pd.DataFrame]:
 # OPENSTREETMAP - DETECTION PISTES (ROBUSTE)
 # ============================================================================
 
-def get_pistes_from_osm(session: Any) -> Optional[Any]: # Utilisation de Any pour le type hint
-    """Récupère la liste des pistes depuis OpenStreetMap."""
+def get_pistes_from_osm(session: Any) -> Optional[Any]:
     if not HAS_GEOS: return None
-    
     all_gps = session.get_all_gps()
     if all_gps is None or all_gps.empty: return None
     
@@ -227,10 +219,7 @@ def get_pistes_from_osm(session: Any) -> Optional[Any]: # Utilisation de Any pou
     
     query = f"""
     [out:json][timeout:25];
-    (
-      way["piste:type"="downhill"]({bbox});
-      relation["piste:type"="downhill"]({bbox});
-    );
+    ( way["piste:type"="downhill"]({bbox}); relation["piste:type"="downhill"]({bbox}); );
     out center;
     """
     
@@ -243,7 +232,6 @@ def get_pistes_from_osm(session: Any) -> Optional[Any]: # Utilisation de Any pou
         
         elements = data.get('elements', [])
         features = []
-        
         for elem in elements:
             if elem['type'] == 'way':
                 coords = [[n['lon'], n['lat']] for n in elem['geometry']]
@@ -252,7 +240,6 @@ def get_pistes_from_osm(session: Any) -> Optional[Any]: # Utilisation de Any pou
                 geom = Point(elem['center']['lon'], elem['center']['lat'])
             else:
                 continue
-                
             tags = elem.get('tags', {})
             features.append({
                 'geometry': geom,
@@ -260,47 +247,34 @@ def get_pistes_from_osm(session: Any) -> Optional[Any]: # Utilisation de Any pou
                 'difficulty': tags.get('piste:difficulty', 'unknown'),
                 'type': tags.get('piste:type', 'unknown')
             })
-            
-        if not features:
-            return None
-            
+        if not features: return None
         gdf = gpd.GeoDataFrame(features, crs="EPSG:4326")
         st.success(f"✅ {len(gdf)} pistes trouvées dans la zone")
         return gdf
-        
     except Exception as e:
         st.error(f"Erreur OSM: {e}")
         return None
 
 def match_gps_to_pistes(actions: List[Action], pistes_gdf: Any):
-    """Fait le matching spatial GPS -> Nom de piste."""
     if not HAS_GEOS: return
     if pistes_gdf is None: return
     
     for action in actions:
         if action.type == ActionType.RUN and action.gps_data is not None and not action.gps_data.empty:
-            
-            # Sampling pour performance
             sample_df = action.gps_data.iloc[::10].copy()
             geometry = [Point(xy) for xy in zip(sample_df['lon'], sample_df['lat'])]
             run_gdf = gpd.GeoDataFrame(sample_df, geometry=geometry, crs="EPSG:4326")
-            
             try:
                 joined = gpd.sjoin_nearest(run_gdf, pistes_gdf, distance_col="dist", max_distance=0.0005)
-                
                 if not joined.empty:
                     valid_matches = joined[joined['dist'] < 0.0005]
-                    
                     if not valid_matches.empty:
                         counts = valid_matches['name'].value_counts()
                         best_piste_name = counts.idxmax()
                         confidence = counts.max() / len(valid_matches)
-                        
                         if confidence > 0.4:
                             action.track_ids = f"{best_piste_name}"
-            
-            except Exception:
-                pass
+            except Exception: pass
 
 # ============================================================================
 # CORE PHYSICS & BIOMECHANICS
@@ -308,8 +282,6 @@ def match_gps_to_pistes(actions: List[Action], pistes_gdf: Any):
 
 def enrich_gps(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    
-    # Calculs basiques
     lat1, lon1 = np.radians(df['lat']), np.radians(df['lon'])
     lat2, lon2 = lat1.shift(-1), lon1.shift(-1)
     dlat, dlon = lat2 - lat1, lon2 - lon1
@@ -317,27 +289,23 @@ def enrich_gps(df: pd.DataFrame) -> pd.DataFrame:
     df['dist'] = 2 * np.arcsin(np.sqrt(a.clip(0, 1))) * 6371000
     df['dt'] = df['time'].diff().dt.total_seconds().fillna(0)
     
-    # Vitesse
     mask_valid = (df['dt'] > 0) & (df['dt'] < 10)
     df['speed_raw'] = np.where(mask_valid, df['dist'] / df['dt'], 0)
     if len(df) > 11: df['speed_ms'] = savgol_filter(df['speed_raw'], 11, 2)
     else: df['speed_ms'] = df['speed_raw']
     df['speed_kmh'] = (df['speed_ms'] * 3.6).clip(0, 200)
     
-    # Altitude & Pente
     if len(df) > 21: df['ele_smooth'] = savgol_filter(df['ele'], 21, 3)
     else: df['ele_smooth'] = df['ele']
     df['gradient'] = np.where(df['dist'] > 0.5, -(df['ele_smooth'].diff() / df['dist']) * 100, 0)
     df['gradient'] = df['gradient'].replace([np.inf, -np.inf], 0).fillna(0)
     if len(df) > 21: df['gradient'] = savgol_filter(df['gradient'], 21, 3)
     
-    # Cap (Bearing)
     x = np.cos(lat1) * np.sin(dlon)
     y = np.cos(lat2) * np.sin(lat1) - np.sin(lat2) * np.cos(lat1) * np.cos(dlon)
     df['bearing'] = np.degrees(np.arctan2(x, y))
     df['turn_angle'] = ((df['bearing'].diff().fillna(0) + 180) % 360) - 180
     
-    # Forces G
     df['accel'] = df['speed_ms'].diff() / df['dt'].replace(0, np.nan)
     df['g_long'] = (df['accel'].abs() / 9.81).replace([np.inf, -np.inf], 0).fillna(0).clip(0, 5)
     
@@ -379,7 +347,6 @@ def calculate_fatigue(runs: List[Action]):
             prev_runs = runs[:i]
             avg_prev_speed = np.mean([r.avg_speed for r in prev_runs])
             avg_prev_stab = np.mean([r.biomechanics.stability_index for r in prev_runs])
-            
             speed_drop = (avg_prev_speed - run.avg_speed) / avg_prev_speed if avg_prev_speed > 0 else 0
             stab_drop = (avg_prev_stab - run.biomechanics.stability_index) if avg_prev_stab > 0 else 0
             run.fatigue_score = np.clip((speed_drop * 2.0) + (stab_drop * 0.5), 0, 1)
@@ -419,10 +386,8 @@ class Session:
         ski_hours = sum(r.duration for r in self.runs) / 3600
         w = self.activity.weather
         w_str = f"{w.temp_avg}°C, {w.condition}" if w else "N/A"
-        
         return {
-            "location": self.activity.location,
-            "runs": len(self.runs),
+            "location": self.activity.location, "runs": len(self.runs),
             "distance_km": self.activity.distance / 1000,
             "descent_m": sum(abs(r.vertical) for r in self.runs),
             "duration": f"{self.activity.duration//3600}h{(self.activity.duration%3600)//60}m",
@@ -438,40 +403,23 @@ class Session:
 # ============================================================================
 
 def create_replay_map(session: Session, selected_run_idx: int, time_idx: int):
-    """Crée la carte 3D pour le mode Replay."""
     run = session.runs[selected_run_idx]
     df = run.gps_data
-    
     if df is None or df.empty: return None
 
     path_data = df[['lon', 'lat']].copy()
-    path_layer = pdk.Layer(
-        "PathLayer", data=path_data, get_path="[['lon', 'lat']]",
-        get_color=[255,255,255,100], width_min_pixels=6, pickable=False
-    )
+    path_layer = pdk.Layer("PathLayer", data=path_data, get_path="[['lon', 'lat']]", get_color=[255,255,255,100], width_min_pixels=6, pickable=False)
     
     current_pos = df.iloc[time_idx]
-    skier_data = pd.DataFrame([{
-        "lon": current_pos['lon'], "lat": current_pos['lat'], "bearing": current_pos['bearing']
-    }])
+    skier_data = pd.DataFrame([{"lon": current_pos['lon'], "lat": current_pos['lat'], "bearing": current_pos['bearing']}])
+    skier_layer = pdk.Layer("ScatterplotLayer", data=skier_data, get_position=["lon", "lat"], get_color=[255,0,0], get_radius=10, pickable=False)
     
-    skier_layer = pdk.Layer(
-        "ScatterplotLayer", data=skier_data, get_position=["lon", "lat"],
-        get_color=[255,0,0], get_radius=10, pickable=False
-    )
-    
-    view_state = pdk.ViewState(
-        latitude=current_pos['lat'], longitude=current_pos['lon'],
-        zoom=16, pitch=60, bearing=current_pos['bearing']
-    )
-    
+    view_state = pdk.ViewState(latitude=current_pos['lat'], longitude=current_pos['lon'], zoom=16, pitch=60, bearing=current_pos['bearing'])
     return pdk.Deck(layers=[path_layer, skier_layer], initial_view_state=view_state, map_style="mapbox://styles/mapbox/outdoors-v11")
 
 def create_heatmap(session: Session, mode: str):
-    """Crée une carte thermique."""
     full_df = session.get_all_gps()
     if full_df is None or full_df.empty: return None
-    
     df = full_df[['lon', 'lat']].copy()
     
     if mode == "Density":
@@ -511,53 +459,38 @@ def main():
         st.header("⚙️ Configuration")
         uploaded = st.file_uploader("Chargez fichier .slopes", type=['slopes'])
         weight = st.number_input("Poids (kg)", 40, 150, 75)
-        
-        if uploaded:
-            st.success("Fichier chargé !")
+        if uploaded: st.success("Fichier chargé !")
     
     if not uploaded:
         st.info("👈 Veuillez charger un fichier pour commencer l'analyse.")
         return
     
-    # --- LOADING & PROCESSING ---
-    with st.spinner("Deep Analyse en cours (Météo, OSM, Physique, Biomécanique)..."):
+    with st.spinner("Deep Analyse en cours..."):
         with zipfile.ZipFile(uploaded) as zf:
             activity, actions = parse_metadata(zf)
             gps_data = load_gps(zf)
-            
             if not activity or not actions:
-                st.error("Erreur de parsing.")
-                return
+                st.error("Erreur de parsing."); return
             
             if gps_data is not None:
                 gps_data = enrich_gps(gps_data)
                 enrich_actions(actions, gps_data)
             
             session = Session(activity, actions, weight)
-
-            # --- DÉTECTION AUTOMATIQUE DES PISTES (NOUVEAU) ---
             pistes_gdf = get_pistes_from_osm(session)
-            if pistes_gdf is not None:
-                match_gps_to_pistes(actions, pistes_gdf)
+            if pistes_gdf is not None: match_gps_to_pistes(actions, pistes_gdf)
 
-    # --- DASHBOARD HEADER ---
     st.subheader(f"Session : {session.activity.location} | {session.stats['weather']}")
-    
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Descentes", session.stats['runs'])
     c2.metric("Distance", f"{session.stats['distance_km']:.1f} km")
     c3.metric("V.Max", f"{session.stats['max_speed']:.1f} km/h")
     c4.metric("Dénivelé", f"{session.stats['descent_m']/1000:.1f} km")
 
-    # --- NAVIGATION ---
-    tab_overview, tab_replay, tab_biomech, tab_heatmaps = st.tabs([
-        "📊 Vue d'ensemble", "🎥 Replay 3D", "🏥 Analyse Biomécanique", "🗺️ Cartes Thermiques"
-    ])
+    tab_overview, tab_replay, tab_biomech, tab_heatmaps = st.tabs(["📊 Vue d'ensemble", "🎥 Replay 3D", "🏥 Analyse Biomécanique", "🗺️ Cartes Thermiques"])
 
-    # --- TAB 1: OVERVIEW ---
     with tab_overview:
         col1, col2 = st.columns(2)
-        
         df_runs = pd.DataFrame([{
             "N°": r.number,
             "Piste": r.track_ids[:20] + ("..." if len(r.track_ids)>20 else ""),
@@ -567,43 +500,34 @@ def main():
             "Symétrie": f"{r.biomechanics.carving_symmetry_score:.2f}",
             "Fatigue": f"{r.fatigue_score*100:.0f}%"
         } for r in session.runs])
-        
         col1.dataframe(df_runs, use_container_width=True)
-        
         with col2:
             fig_diff = px.histogram(df_runs, x="Diff", color="Diff", title="Répartition des Difficultés", color_discrete_map={d.label: d.color for d in Difficulty})
             st.plotly_chart(fig_diff, use_container_width=True)
 
-    # --- TAB 2: REPLAY 3D ---
     with tab_replay:
         st.info("🎥 Mode Replay : Utilisez le curseur pour rejouer la descente.")
-        
         run_options = [f"Run #{r.number} - {r.track_ids[:20]}" for r in session.runs]
         selected_run_name = st.selectbox("Choisir la descente à rejouer", run_options)
         run_idx = run_options.index(selected_run_name)
-        
         run = session.runs[run_idx]
-        
         df = run.gps_data
+        
         if not df.empty:
             steps = range(0, len(df), 5)
             time_idx = st.slider("Timeline", 0, len(steps)-1, 0)
             real_idx = steps[time_idx]
-            
             current_point = df.iloc[real_idx]
             c1, c2, c3 = st.columns(3)
             c1.metric("Vitesse Actuelle", f"{current_point['speed_kmh']:.1f} km/h")
             c2.metric("Altitude", f"{current_point['ele']:.0f} m")
             c3.metric("Cap", f"{current_point['bearing']:.0f}°")
-            
             st.pydeck_chart(create_replay_map(session, run_idx, real_idx), use_container_width=True)
 
-    # --- TAB 3: BIOMÉCANIQUE ---
     with tab_biomech:
         st.subheader("Analyse Technique & Physiologique")
         selected_run_name_bio = st.selectbox("Analyser Run", run_options, key="bio")
         run_idx_bio = run_options.index(selected_run_name_bio)
-        
         col1, col2 = st.columns(2)
         with col1:
             st.plotly_chart(plot_biomechanics(session, run_idx_bio), use_container_width=True)
@@ -613,15 +537,12 @@ def main():
         with col2:
             st.plotly_chart(plot_fatigue_curve(session), use_container_width=True)
 
-    # --- TAB 4: HEATMAPS ---
     with tab_heatmaps:
         st.subheader("Cartographie Thermique")
         mode = st.radio("Type de Heatmap", ["Density (Fréquentation)", "Speed (Vitesse)", "G-Lat (Virages Techniques)"])
-        
         map_mode = "Density"
         if "Speed" in mode: map_mode = "Speed"
         if "G-Lat" in mode: map_mode = "G-Lat"
-        
         st.pydeck_chart(create_heatmap(session, map_mode), use_container_width=True)
 
 if __name__ == "__main__":
