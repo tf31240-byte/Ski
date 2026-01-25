@@ -1,6 +1,4 @@
 import streamlit as st
-import gpxpy
-import gpxpy.gpx
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -8,17 +6,14 @@ import plotly.graph_objects as go
 import pydeck as pdk
 from scipy.signal import savgol_filter
 from datetime import datetime, timedelta, timezone
-import io
-import json
-import time
 import zipfile
 import requests
 import xml.etree.ElementTree as ET
-from dateutil import parser as date_parser # Nécessaire pour lire les dates ISO souples
+from dateutil import parser as date_parser
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="Ski Analytics Pro - Ultimate Edition", 
+    page_title="Ski Analytics Pro - Slope Edition", 
     layout="wide", 
     page_icon="🏔️",
     initial_sidebar_state="expanded"
@@ -30,8 +25,6 @@ st.markdown("""
     .main { padding-top: 2rem; }
     .stTabs [data-baseweb="tab-list"] { gap: 20px; }
     .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; }
-    .big-font { font-size:20px !important; }
-    .metric-box { text-align: center; border: 1px solid #ddd; padding: 10px; border-radius: 10px; background-color: #f9f9f9; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -46,6 +39,7 @@ DIFFICULTY_THRESHOLDS = {
 # --- UTILITIES ---
 
 def calculate_distance_vectorized(df):
+    """Calcul vectorisé de la distance Haversine."""
     lat1, lon1 = np.radians(df['lat']), np.radians(df['lon'])
     lat2, lon2 = np.radians(df['lat'].shift(-1)), np.radians(df['lon'].shift(-1))
     dlat = lat2 - lat1
@@ -74,15 +68,15 @@ def get_weather_cached(lat, lon):
         pass
     return None
 
-# --- IMPROVED SLOPE PARSER ---
+# --- SLOPE PARSERS (XML & CSV) ---
 
 def parse_slope_metadata(zip_file):
     """
-    Extrait et analyse le fichier Metadata.txt (XML) du ZIP.
+    Extrait et analyse le fichier Metadata (XML) du ZIP.
     Retourne une liste de segments (Lift/Run) avec des timestamps UTC.
     """
     try:
-        # Chercher le fichier Metadata (souvent nommé Metadata.txt ou Metadata.xml dans le zip)
+        # Chercher le fichier Metadata
         metadata_files = [f for f in zip_file.namelist() if 'metadata' in f.lower()]
         
         if not metadata_files:
@@ -94,19 +88,10 @@ def parse_slope_metadata(zip_file):
             tree = ET.parse(f)
             root = tree.getroot()
             
-            # Récupérer le timezone global si dispo
-            tz_offset_str = root.get('timeZoneOffset', '+00:00')
-            # Conversion simple de l'offset (+1, +0100) en timedelta
-            try:
-                hours = int(tz_offset_str.replace('+', '').split(':')[0])
-                tz_info = timezone(timedelta(hours=hours))
-            except:
-                tz_info = timezone.utc
-            
             segments = []
-            # Parser chaque Action
+            # Parser chaque Action (Run ou Lift)
             for action in root.findall('.//Action'):
-                action_type = action.get('type') # Lift ou Run
+                action_type = action.get('type') # 'Lift' ou 'Run'
                 start_str = action.get('start')
                 end_str = action.get('end')
                 
@@ -124,26 +109,30 @@ def parse_slope_metadata(zip_file):
                             'type': action_type,
                             'start': start_utc,
                             'end': end_utc,
-                            'id': action.get('numberOfType') # Index du run
+                            'id': action.get('numberOfType')
                         })
                     except Exception as e:
-                        st.warning(f"Erreur de parsing d'une action: {e}")
-                        continue
+                        continue # Ignorer les segments mal formatés
             
             return segments
             
     except Exception as e:
-        st.warning(f"Impossible de lire le Metadata: {e}")
         return None
 
 def load_slope_file(uploaded_file):
+    """Charge le fichier .slope (ZIP) et extrait le CSV GPS + le XML Metadata."""
     try:
         with zipfile.ZipFile(uploaded_file, 'r') as z:
             # 1. Charger les Métadonnées (XML)
             metadata_segments = parse_slope_metadata(z)
             
-            # 2. Charger les données GPS
+            if not metadata_segments:
+                st.error("Fichier Slope invalide : Métadonnées XML manquantes ou illisibles.")
+                return None, None
+
+            # 2. Charger les données GPS (CSV)
             target_csv = None
+            # Préférence pour GPS.csv (plus propre) sinon RawGPS.csv
             for fname in z.namelist():
                 if 'GPS.csv' in fname and 'Raw' not in fname:
                     target_csv = fname
@@ -155,71 +144,71 @@ def load_slope_file(uploaded_file):
                         break
 
             if not target_csv:
-                st.error("Aucun fichier GPS trouvé.")
+                st.error("Aucun fichier GPS (GPS.csv ou RawGPS.csv) trouvé.")
                 return None, None
 
             with z.open(target_csv) as f:
                 # Lecture robuste CSV
-                # On lit d'abord quelques lignes pour détecter s'il y a un header
+                # On lit la première ligne pour détecter la structure
                 first_line = f.readline().decode('utf-8').strip()
-                f.seek(0) # Retour au début
+                f.seek(0)
                 
-                # Heuristique : Si la 2ème colonne ressemble à un timestamp > 1 milliard, c'est probablement des données sans header
                 parts = [p.strip() for p in first_line.split('|')]
-                is_data = False
+                
+                # Détection intelligente : Si la 2ème colonne est un timestamp > 2001, pas de header
+                has_header = True
                 try:
                     val = float(parts[1])
-                    if val > 1_000_000_000: # Timestamp Unix > 2001
-                        is_data = True
+                    if val > 1_000_000_000:
+                        has_header = False
                 except:
                     pass
                 
-                if is_data:
+                if not has_header:
+                    # Lecture sans header (ordre standard: Index, Time, Lat, Lon, Alt)
                     df_raw = pd.read_csv(f, sep='|', header=None, engine='python')
-                    # On suppose l'ordre standard Slope: Index, Time, Lat, Lon, Alt, ...
-                    # On prend les colonnes utiles
+                    # On prend les colonnes 1, 2, 3, 4
                     df_raw = df_raw.iloc[:, [1, 2, 3, 4]] 
                     df_raw.columns = ['time', 'lat', 'lon', 'ele']
                 else:
                     df_raw = pd.read_csv(f, sep='|', engine='python')
-                    # Nettoyage noms colonnes
                     df_raw.columns = [c.strip() for c in df_raw.columns]
                     
-                    # Mapping colonnes
+                    # Mapping des colonnes par nom
                     mapping = {}
                     for c in df_raw.columns:
                         cl = c.lower()
                         if 'time' in cl or 'timestamp' in cl: mapping['time'] = c
                         elif 'lat' in cl: mapping['lat'] = c
                         elif 'lon' in cl or 'long' in cl: mapping['lon'] = c
-                        elif 'alt' in cl or 'ele' in cl: mapping['ele'] = c
+                        elif 'alt' in cl or 'ele' in cl or 'elevation' in cl: mapping['ele'] = c
                     
                     if len(mapping) == 4:
                         df_raw = df_raw[list(mapping.values())]
                         df_raw.columns = ['time', 'lat', 'lon', 'ele']
                     else:
-                        # Fallback positionnel si mapping échoue
+                        # Fallback positionnel
                         df_raw = df_raw.iloc[:, [1, 2, 3, 4]]
                         df_raw.columns = ['time', 'lat', 'lon', 'ele']
 
-                # Conversion
+                # Conversion des types
+                # Les timestamps Slope sont en secondes Unix
                 df_raw['time'] = pd.to_datetime(df_raw['time'], unit='s', utc=True, errors='coerce')
                 df_raw['lat'] = pd.to_numeric(df_raw['lat'], errors='coerce')
                 df_raw['lon'] = pd.to_numeric(df_raw['lon'], errors='coerce')
                 df_raw['ele'] = pd.to_numeric(df_raw['ele'], errors='coerce')
                 
+                # Nettoyage
                 df_raw = df_raw.dropna(subset=['time', 'lat', 'lon', 'ele'])
                 df_raw = df_raw.sort_values('time').reset_index(drop=True)
 
                 return df_raw, metadata_segments
 
     except Exception as e:
-        st.error(f"Erreur lecture Slope: {e}")
-        import traceback
-        traceback.print_exc()
+        st.error(f"Erreur lors de la lecture du fichier Slope: {e}")
         return None, None
 
-# --- CORE LOGIC (UPDATED) ---
+# --- CORE LOGIC (OPTIMIZED FOR XML) ---
 
 class SkiRun:
     def __init__(self, run_id, df_segment):
@@ -245,9 +234,15 @@ class SkiRun:
         self.avg_grade = abs(self.df['gradient'].mean())
         self.max_grade = abs(self.df['gradient'].max())
         
-        color_counts = self.df['color_name'].value_counts()
-        self.color = color_counts.index[0] if not color_counts.empty else "Inconnue"
+        # Couleur basée sur la pente moyenne
+        g = abs(self.avg_grade)
+        self.color = "Inconnue"
+        for k, v in DIFFICULTY_THRESHOLDS.items():
+            if v['min'] <= g < v['max']:
+                self.color = k
+                break
         
+        # Carving (virages > 30°)
         turns = self.df[self.df['turn_angle'].abs() > 30] 
         if not turns.empty:
             self.avg_turn_angle = turns['turn_angle'].abs().mean()
@@ -279,7 +274,7 @@ class SkiSession:
     def _process_session(self):
         df = self.df_raw.copy().reset_index(drop=True)
         
-        # 1. Calculs Physiques communs (indispensables pour les graphs)
+        # 1. Calculs Physiques communs
         df['ele_smooth'] = smooth_series(df['ele'], window_length=21, polyorder=3)
         df['dist'] = calculate_distance_vectorized(df)
         df['dt'] = df['time'].diff().dt.total_seconds().fillna(0)
@@ -307,24 +302,30 @@ class SkiSession:
         df['turn_angle'] = df['bearing'].diff()
         df['turn_angle'] = df['turn_angle'].clip(-180, 180)
 
-        # 2. Segmentation Intelligente (Si Metadata dispo)
+        # 2. Segmentation basée sur le METADATA XML (La Vérité)
+        # Initialisation à 'Arret' par défaut (pour ce qui n'est pas dans le XML)
+        df['state'] = 'Arret'
+        
         if self.metadata_segments:
-            df['state'] = 'Arret' # Défaut
+            # On applique les segments XML
             for seg in self.metadata_segments:
-                # Filtrage temporel précis
-                mask_seg = (df['time'] >= seg['start']) & (df['time'] <= seg['end'])
+                action_type = seg['type'].lower() # 'lift' ou 'run'
+                start_t = seg['start']
+                end_t = seg['end']
                 
-                if seg['type'].lower() == 'lift':
+                # Création du masque temporel
+                mask_seg = (df['time'] >= start_t) & (df['time'] <= end_t)
+                
+                if action_type == 'lift':
                     df.loc[mask_seg, 'state'] = 'Remontee'
-                elif seg['type'].lower() == 'run':
+                elif action_type == 'run':
                     df.loc[mask_seg, 'state'] = 'Ski'
         else:
-            # Fallback Heuristique (ancienne méthode)
-            df['state'] = 'Arret'
-            is_lift = (df['speed_kmh'] < 25) & (df['speed_kmh'] > 2) & (df['grade_raw'] > 2)
-            df.loc[is_lift, 'state'] = 'Remontee'
-            is_ski = (df['speed_kmh'] > 5) & (df['grade_raw'] < -1)
-            df.loc[is_ski, 'state'] = 'Ski'
+            # Cas d'erreur critique : Fichier Slope sans Metadata XML exploitable
+            st.error("Les métadonnées XML sont manquantes. La segmentation est impossible.")
+            # On ne peut pas continuer l'analyse proprement sans info de segment
+            self.df = df
+            return
 
         self.df = df
         self._detect_runs()
@@ -332,13 +333,9 @@ class SkiSession:
     def _detect_runs(self):
         """Crée les objets SkiRun basés sur la colonne 'state'."""
         df = self.df
-        # Utilisation de groupby sur les changements d'état
-        # On ajoute un segment_id pour chaque bloc continu du même état
         df['segment'] = (df['state'] != df['state'].shift()).cumsum()
         
         run_id = 1
-        # Si on a des métadonnées, on pourrait aussi itérer directement dessus,
-        # mais utiliser le state calculé permet de rester cohérent avec l'affichage global.
         for seg_id, group in df.groupby('segment'):
             if group['state'].iloc[0] != 'Ski':
                 continue
@@ -346,7 +343,8 @@ class SkiSession:
             duration = group['dt'].sum()
             drop = group['ele_smooth'].max() - group['ele_smooth'].min()
             
-            if duration < 30 or drop < 20: # Filtre qualité
+            # Filtre qualité (ignore les micro-séquences ski)
+            if duration < 30 or drop < 20:
                 continue
                 
             run = SkiRun(run_id, group)
@@ -355,13 +353,11 @@ class SkiSession:
 
     def get_global_stats(self):
         total_dist = self.df['dist'].sum() / 1000
-        # Calcul du dénivelé total skié (somme des descentes positives)
-        # Ici on prend simple max - min global skié
         df_ski = self.df[self.df['state']=='Ski']
+        
+        total_descent = 0
         if not df_ski.empty:
             total_descent = df_ski['ele_smooth'].max() - df_ski['ele_smooth'].min()
-        else:
-            total_descent = 0
 
         ski_time_hours = df_ski['dt'].sum() / 3600
         met = 6.5
@@ -377,7 +373,7 @@ class SkiSession:
             "duration": f"{int(ski_time_hours)}h {int((ski_time_hours%1)*60)}m"
         }
 
-# --- VISUALIZATION (Inchangé) ---
+# --- VISUALIZATION ---
 class Visualizer:
     @staticmethod
     def plot_elevation(df):
@@ -420,54 +416,43 @@ class Visualizer:
 
         return pdk.Deck(layers=[heatmap_layer, path_layer], initial_view_state=view_state, map_style=map_style, map_provider=provider, tooltip={"text": "Alt: {ele_smooth}m\nVit: {speed_kmh} km/h"}, api_key=mapbox_token)
 
-# --- MAIN APP (Updated Inputs) ---
+# --- MAIN APP ---
 
 def main():
     with st.sidebar:
         st.title("⚙️ Configuration")
-        uploaded_file = st.file_uploader("📂 Charger GPX ou Slope", type=['gpx', 'slope'])
+        # Uniquement le format .slope maintenant
+        uploaded_file = st.file_uploader("📂 Charger fichier Slope", type=['slope'])
+        
+        st.subheader("Utilisateur")
         user_weight = st.number_input("Poids (kg)", 40, 150, 75)
+        
+        st.subheader("Préférences")
         mapbox_token = st.text_input("Mapbox Token (Optionnel)", type="password")
-        show_all_runs = st.checkbox("Voir toutes les descentes sur la carte", value=False)
 
     if uploaded_file:
         try:
             raw_df = None
             metadata = None
-            file_type = uploaded_file.name.split('.')[-1].lower()
 
-            with st.spinner(f"Analyse {file_type.upper()}..."):
-                if file_type == 'slope':
-                    raw_df, metadata = load_slope_file(uploaded_file)
-                    if raw_df is None: return
-                    if metadata:
-                        st.info("✅ Métadonnées Slope détectées : Segmentation précise activée.")
+            with st.spinner("Analyse des données Slope en cours..."):
+                # Chargement unifié Slope
+                raw_df, metadata = load_slope_file(uploaded_file)
                 
-                elif file_type == 'gpx':
-                    file_bytes = uploaded_file.read()
-                    try: file_str = file_bytes.decode('utf-8')
-                    except: file_str = file_bytes.decode('latin-1')
-                    gpx = gpxpy.parse(io.StringIO(file_str))
-                    points = []
-                    for track in gpx.tracks:
-                        for seg in track.segments:
-                            for p in seg.segments[0].points:
-                                points.append({'time': p.time, 'lat': p.latitude, 'lon': p.longitude, 'ele': p.elevation})
-                    raw_df = pd.DataFrame(points).dropna(subset=['lat', 'lon'])
+                if raw_df is None or metadata is None:
+                    st.stop()
 
-                if raw_df is None:
-                    st.error("Erreur lecture données.")
-                    return
-
+                # Création de la session
                 session = SkiSession(raw_df, user_weight, metadata_segments=metadata)
-                st.success(f"Session analysée : {len(session.runs)} descentes détectées.")
+                
+            st.success(f"Session analysée : {len(session.runs)} descentes détectées (via XML).")
 
-            # --- ONGLETS ---
             tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🎿 Liste des Descentes", "📉 Analyse Technique", "🗺️ Carte 3D"])
 
             with tab1:
                 st.header("Vue d'ensemble")
                 stats = session.get_global_stats()
+                
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Distance Totale", f"{stats['distance']:.1f} km")
                 c2.metric("Dénivelé Positif", f"{stats['descent']:.0f} m")
@@ -488,9 +473,14 @@ def main():
                 for run in session.runs:
                     m = run.get_metrics()
                     run_data.append({
-                        "N°": run.id, "Heure": run.start_time.strftime('%H:%M') if run.start_time else "-",
-                        "Couleur": run.color, "Durée": m["Durée"], "Dist (m)": int(run.distance_m),
-                        "VMax (km/h)": int(run.max_speed), "G Max": m["G Max"], "Carving (°)": m["Carving (Angle Moy)"]
+                        "N°": run.id, 
+                        "Heure": run.start_time.strftime('%H:%M') if run.start_time else "-",
+                        "Couleur": run.color, 
+                        "Durée": m["Durée"], 
+                        "Dist (m)": int(run.distance_m),
+                        "VMax (km/h)": int(run.max_speed), 
+                        "G Max": m["G Max"], 
+                        "Carving (°)": m["Carving (Angle Moy)"]
                     })
                 df_runs = pd.DataFrame(run_data)
                 st.dataframe(df_runs, use_container_width=True)
@@ -524,8 +514,8 @@ def main():
             st.error("Erreur lors de l'analyse.")
             st.exception(e)
     else:
-        st.title("Ski Analytics Pro")
-        st.info("Veuillez charger un fichier .slope ou .gpx.")
+        st.title("Ski Analytics Pro - Slope Only")
+        st.info("Veuillez charger un fichier .slope pour commencer.")
 
 if __name__ == "__main__":
     main()
