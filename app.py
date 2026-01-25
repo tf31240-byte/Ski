@@ -1,11 +1,9 @@
 """
-SKI ANALYTICS PRO - ULTIMATE EDITION
-====================================
-Fonctionnalités :
-- Replay 3D Interactif (First Person View)
-- Analyse Biomécanique (Équilibre G/D, Symétrie, Fatigue)
-- Heatmaps (Vitesse, G-Force, Fréquentation)
-- Détection automatique des noms de pistes (OpenStreetMap)
+SKI ANALYTICS PRO - ULTIMATE EDITION (FIXED)
+============================================
+Corrections : 
+- Gestion sécurisée de l'import geopandas (pas de crash si absent)
+- Types hints sécurisés pour éviter NameError au chargement
 """
 
 import sys
@@ -22,20 +20,33 @@ import zipfile
 import xml.etree.ElementTree as ET
 from dateutil import parser as date_parser
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict
-from enum import Enum
+from typing import List, Optional, Tuple, Dict, Enum, Any
 import requests
 
-# Tentative d'import pour la géométrie (Obligatoire pour les pistes)
+# ============================================================================
+# IMPORTS GÉOSPATIAUX (OPTIONNELS)
+# ============================================================================
+
 try:
     import geopandas as gpd
     from shapely.geometry import Point, shape
     HAS_GEOS = True
 except ImportError:
     HAS_GEOS = False
-    st.warning("⚠️ 'geopandas' et 'shapely' non installés. La détection des pistes sera désactivée. Installez-les avec `pip install geopandas shapely`.")
+    # On définit des objets factices pour éviter le crash lors du parsing des types
+    # Cela permet au script de démarrer même si geopandas n'est pas là.
+    class _GeoDataFrame: pass
+    class _Point: pass
+    class _Shape: pass
+    
+    gpd = type('gpd', (), {'GeoDataFrame': _GeoDataFrame})()
+    Point = _Point
+    shape = _Shape
 
 st.set_page_config(page_title="Ski Analytics Pro Ultimate", layout="wide")
+
+if not HAS_GEOS:
+    st.sidebar.warning("⚠️ 'geopandas' non installé. La détection des noms de pistes est désactivée.")
 
 # ============================================================================
 # MODELS & CONFIG
@@ -85,7 +96,6 @@ class Activity:
 
 @dataclass
 class Biomechanics:
-    """Stocke les données biomécaniques calculées"""
     left_turns_count: int = 0
     right_turns_count: int = 0
     avg_g_left: float = 0.0
@@ -201,10 +211,10 @@ def load_gps(zip_file: zipfile.ZipFile) -> Optional[pd.DataFrame]:
     except: return None
 
 # ============================================================================
-# OPENSTREETMAP - DETECTION PISTES
+# OPENSTREETMAP - DETECTION PISTES (ROBUSTE)
 # ============================================================================
 
-def get_pistes_from_osm(session: 'Session') -> Optional[gpd.GeoDataFrame]:
+def get_pistes_from_osm(session: Any) -> Optional[Any]: # Utilisation de Any pour le type hint
     """Récupère la liste des pistes depuis OpenStreetMap."""
     if not HAS_GEOS: return None
     
@@ -262,8 +272,9 @@ def get_pistes_from_osm(session: 'Session') -> Optional[gpd.GeoDataFrame]:
         st.error(f"Erreur OSM: {e}")
         return None
 
-def match_gps_to_pistes(actions: List[Action], pistes_gdf: gpd.GeoDataFrame):
+def match_gps_to_pistes(actions: List[Action], pistes_gdf: Any):
     """Fait le matching spatial GPS -> Nom de piste."""
+    if not HAS_GEOS: return
     if pistes_gdf is None: return
     
     for action in actions:
@@ -275,7 +286,6 @@ def match_gps_to_pistes(actions: List[Action], pistes_gdf: gpd.GeoDataFrame):
             run_gdf = gpd.GeoDataFrame(sample_df, geometry=geometry, crs="EPSG:4326")
             
             try:
-                # Jointure Nearest
                 joined = gpd.sjoin_nearest(run_gdf, pistes_gdf, distance_col="dist", max_distance=0.0005)
                 
                 if not joined.empty:
@@ -434,14 +444,12 @@ def create_replay_map(session: Session, selected_run_idx: int, time_idx: int):
     
     if df is None or df.empty: return None
 
-    # 1. Tracé complet
     path_data = df[['lon', 'lat']].copy()
     path_layer = pdk.Layer(
         "PathLayer", data=path_data, get_path="[['lon', 'lat']]",
         get_color=[255,255,255,100], width_min_pixels=6, pickable=False
     )
     
-    # 2. Position actuelle (Skieur)
     current_pos = df.iloc[time_idx]
     skier_data = pd.DataFrame([{
         "lon": current_pos['lon'], "lat": current_pos['lat'], "bearing": current_pos['bearing']
@@ -452,7 +460,6 @@ def create_replay_map(session: Session, selected_run_idx: int, time_idx: int):
         get_color=[255,0,0], get_radius=10, pickable=False
     )
     
-    # 3. Vue subjective
     view_state = pdk.ViewState(
         latitude=current_pos['lat'], longitude=current_pos['lon'],
         zoom=16, pitch=60, bearing=current_pos['bearing']
@@ -553,7 +560,7 @@ def main():
         
         df_runs = pd.DataFrame([{
             "N°": r.number,
-            "Piste": r.track_ids[:20] + ("..." if len(r.track_ids)>20 else ""), # Tronqué pour affichage
+            "Piste": r.track_ids[:20] + ("..." if len(r.track_ids)>20 else ""),
             "Diff": r.difficulty.label,
             "V.Moy": f"{r.avg_speed:.1f}",
             "Pente": f"{r.avg_gradient:.1f}%",
