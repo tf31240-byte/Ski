@@ -7,3 +7,7 @@ pydeck
 haversine
 requests
 scipy
+zipfile
+io
+json
+time
