@@ -6,3 +6,4 @@ pydeck
 scipy
 requests
 python-dateutil
+geopandas shapely requests
