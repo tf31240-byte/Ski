@@ -7,11 +7,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 import pydeck as pdk
 from scipy.signal import savgol_filter
-from haversine import haversine
+# from haversine import haversine # Not used, vectorized function used instead
 from datetime import datetime, timedelta
 import io
 import json
 import time
+import zipfile
+import requests # Nécessaire pour la météo (ajouté pour que le code tourne si non présent)
 
 # --- CONFIGURATION ---
 st.set_page_config(
@@ -79,6 +81,110 @@ def get_weather_cached(lat, lon):
     except:
         pass
     return None
+
+# --- NEW SLOPE PARSER ---
+
+def load_slope_file(uploaded_file):
+    """
+    Extrait et parse un fichier .slope (ZIP) contenant GPS.csv ou RawGPS.csv.
+    """
+    try:
+        with zipfile.ZipFile(uploaded_file, 'r') as z:
+            files_list = z.namelist()
+            target_csv = None
+            
+            # Priorité au fichier GPS.csv (plus propre) sinon RawGPS.csv
+            for fname in files_list:
+                if 'GPS.csv' in fname and 'Raw' not in fname:
+                    target_csv = fname
+                    break
+            
+            if not target_csv:
+                for fname in files_list:
+                    if 'RawGPS.csv' in fname:
+                        target_csv = fname
+                        break
+
+            if not target_csv:
+                st.error("Aucun fichier GPS.csv ou RawGPS.csv trouvé dans l'archive .slope")
+                return None
+
+            with z.open(target_csv) as f:
+                # Lecture du CSV. Le séparateur semble être " | " dans l'exemple
+                # On utilise le moteur python pour gérer des expressions regex
+                df_raw = pd.read_csv(f, sep=r'\s*\|\s*', engine='python', header='infer')
+                
+                # Nettoyage des noms de colonnes (enlever les espaces)
+                df_raw.columns = [c.strip() for c in df_raw.columns]
+                
+                # Détection intelligente des colonnes
+                # Le format standard Slope a souvent: Index, Timestamp, Lat, Lon, Alt, Course, Speed, H_Acc, V_Acc
+                # Si la 1ère ligne de données ressemble à des données (ex: col 0 = '0'), on force header=None
+                
+                # Tenter de mapper les colonnes
+                cols = df_raw.columns.tolist()
+                
+                # Mapping standard
+                col_map = {
+                    'time': None, 'lat': None, 'lon': None, 'ele': None
+                }
+                
+                # Recherche par nom de colonne standard
+                for c in cols:
+                    cl = c.lower()
+                    if cl in ['timestamp', 'time']: col_map['time'] = c
+                    elif cl in ['lat', 'latitude']: col_map['lat'] = c
+                    elif cl in ['lon', 'long', 'longitude']: col_map['lon'] = c
+                    elif cl in ['alt', 'altitude', 'ele', 'elevation']: col_map['ele'] = c
+                
+                # Si on n'a pas trouvé de mapping clair, on utilise les positions (basé sur l'exemple fourni)
+                # Exemple: 0 | 1769155510.064439 | 45.453952 | 6.898351 | 2105...
+                # Pos: Index=0, Time=1, Lat=2, Lon=3, Alt=4
+                
+                if not col_map['time']:
+                    # On vérifie si la 2ème colonne (index 1) ressemble à un timestamp Unix (ex: 1.7e9)
+                    try:
+                        val = df_raw.iloc[0, 1]
+                        if isinstance(val, (int, float)) and val > 1_000_000_000:
+                            # C'est probablement des données sans header, on utilise les positions
+                            # On recharge avec header=None pour être sûr
+                            f.seek(0)
+                            df_raw = pd.read_csv(f, sep=r'\s*\|\s*', engine='python', header=None)
+                            # On prend les colonnes 1,2,3,4
+                            df_raw = df_raw.iloc[:, [1, 2, 3, 4]]
+                            df_raw.columns = ['time', 'lat', 'lon', 'ele']
+                        else:
+                            st.error("Format de colonne inconnu dans le CSV Slope.")
+                            return None
+                    except:
+                        st.error("Erreur lors de l'analyse de la structure du CSV.")
+                        return None
+                else:
+                    # On filtre le dataframe avec les colonnes trouvées
+                    try:
+                        df_raw = df_raw[[col_map['time'], col_map['lat'], col_map['lon'], col_map['ele']]]
+                        df_raw.columns = ['time', 'lat', 'lon', 'ele']
+                    except KeyError:
+                        st.error("Impossible de mapper toutes les colonnes GPS requises.")
+                        return None
+
+                # Conversion des types
+                df_raw['time'] = pd.to_datetime(df_raw['time'], unit='s', errors='coerce')
+                df_raw['lat'] = pd.to_numeric(df_raw['lat'], errors='coerce')
+                df_raw['lon'] = pd.to_numeric(df_raw['lon'], errors='coerce')
+                df_raw['ele'] = pd.to_numeric(df_raw['ele'], errors='coerce')
+                
+                # Suppression des lignes vides ou invalides
+                df_raw = df_raw.dropna(subset=['time', 'lat', 'lon', 'ele'])
+                
+                return df_raw
+
+    except zipfile.BadZipFile:
+        st.error("Le fichier .slope n'est pas une archive ZIP valide.")
+        return None
+    except Exception as e:
+        st.error(f"Erreur lors de la lecture du fichier Slope: {e}")
+        return None
 
 # --- CORE LOGIC (OOP) ---
 
@@ -327,7 +433,8 @@ def main():
     with st.sidebar:
         st.title("⚙️ Configuration")
         
-        uploaded_file = st.file_uploader("📂 Charger GPX", type=['gpx'])
+        # Mise à jour de l'uploader pour accepter .slope et .gpx
+        uploaded_file = st.file_uploader("📂 Charger GPX ou Slope", type=['gpx', 'slope'])
         
         st.subheader("Utilisateur")
         user_weight = st.number_input("Poids (kg)", 40, 150, 75)
@@ -340,28 +447,43 @@ def main():
 
     if uploaded_file:
         try:
-            with st.spinner("Analyse vectorielle et physique en cours..."):
-                # Lecture et parsing
-                file_bytes = uploaded_file.read()
-                # Support encodage binaire ou string
-                try:
-                     file_str = file_bytes.decode('utf-8')
-                except:
-                     file_str = file_bytes.decode('latin-1')
+            raw_df = None
+            
+            # Détection du type de fichier
+            file_type = uploaded_file.name.split('.')[-1].lower()
+
+            with st.spinner(f"Analyse des données {file_type.upper()} en cours..."):
                 
-                gpx = gpxpy.parse(io.StringIO(file_str))
-                points = []
-                for track in gpx.tracks:
-                    for seg in track.segments:
-                        for p in seg.segments[0].points: # Simplification structure
-                             points.append({'time': p.time, 'lat': p.latitude, 'lon': p.longitude, 'ele': p.elevation})
+                if file_type == 'slope':
+                    # Utilisation du nouveau parser Slope
+                    raw_df = load_slope_file(uploaded_file)
+                    if raw_df is None or raw_df.empty:
+                        st.error("Impossible de lire les données du fichier Slope.")
+                        return
                 
-                if not points:
-                    st.error("Fichier vide ou format inconnu.")
+                elif file_type == 'gpx':
+                    # Logique existante pour GPX
+                    file_bytes = uploaded_file.read()
+                    try:
+                        file_str = file_bytes.decode('utf-8')
+                    except:
+                        file_str = file_bytes.decode('latin-1')
+                    
+                    gpx = gpxpy.parse(io.StringIO(file_str))
+                    points = []
+                    for track in gpx.tracks:
+                        for seg in track.segments:
+                            for p in seg.segments[0].points:
+                                points.append({'time': p.time, 'lat': p.latitude, 'lon': p.longitude, 'ele': p.elevation})
+                    
+                    if not points:
+                        st.error("Fichier GPX vide ou format inconnu.")
+                        return
+                    raw_df = pd.DataFrame(points).dropna(subset=['lat', 'lon'])
+                else:
+                    st.error("Format de fichier non supporté.")
                     return
 
-                raw_df = pd.DataFrame(points).dropna(subset=['lat', 'lon'])
-                
                 # Création de la session (Calculs lourds)
                 session = SkiSession(raw_df, user_weight)
                 
@@ -458,7 +580,7 @@ def main():
                 
                 if not jumps.empty:
                     st.warning(f"{len(jumps)} pics de variation d'altitude détectés (potentiels sauts/bosses).")
-                    st.write("*Attention : La détection de saut par GPS GPS est approximative. Le bruit du signal peut créer des faux positifs.*")
+                    st.write("*Attention : La détection de saut par GPS est approximative. Le bruit du signal peut créer des faux positifs.*")
 
             with tab4:
                 st.header("Carte Interactive 3D")
@@ -476,7 +598,7 @@ def main():
             st.exception(e)
     else:
         st.title("Ski Analytics Pro")
-        st.info("Veuillez charger un fichier GPX (format standard ou export Slopes) dans la barre latérale.")
+        st.info("Veuillez charger un fichier GPX (format standard) ou un fichier Slope (application Slopes) dans la barre latérale.")
 
 if __name__ == "__main__":
     main()
