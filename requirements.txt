@@ -1,13 +1,8 @@
 streamlit
-gpxpy
 pandas
 numpy
 plotly
 pydeck
-haversine
-requests
 scipy
-zipfile
-io
-json
-time
+requests
+python-dateutil
