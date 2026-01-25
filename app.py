@@ -13,7 +13,7 @@ from dateutil import parser as date_parser
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="Ski Analytics Pro - Debug Edition", 
+    page_title="Ski Analytics Pro - Universal Slope Edition", 
     layout="wide", 
     page_icon="🏔️",
     initial_sidebar_state="expanded"
@@ -47,18 +47,14 @@ def calculate_distance_vectorized(df):
     return pd.Series(np.append(c * 6371000, 0))
 
 def smooth_series(series, window_length=21, polyorder=2):
-    """Lissage sécurisé contre les erreurs de dimensions ou valeurs NaN."""
+    """Lissage sécurisé."""
     if len(series) < window_length:
         return series
-    
-    # On remplace les NaN par interpolation pour éviter que savgol_filter ne plante
     if series.isnull().any():
         series = series.interpolate(method='linear').ffill().bfill()
-    
     try:
         return savgol_filter(series, window_length=window_length, polyorder=polyorder)
     except Exception:
-        # Fallback si erreur de lissage (ex: valeurs infinies)
         return series
 
 def get_speed_color(speed_kmh):
@@ -84,7 +80,7 @@ def get_weather_cached(lat, lon):
         pass
     return None
 
-# --- PARSERS (DEBUG MODE) ---
+# --- PARSERS (ROBUSTE) ---
 
 def parse_slope_metadata(zip_file):
     """Extrait les actions Lift/Run du XML."""
@@ -102,8 +98,8 @@ def parse_slope_metadata(zip_file):
             root = tree.getroot()
             
             segments = []
-            # Recherche robuste des tags Action (avec ou sans namespace)
-            for action in root.findall('.//{http://www.toposoft.com/Activity}Action') + root.findall('.//Action'):
+            # Recherche robuste des tags Action
+            for action in root.findall('.//Action'):
                 action_type = action.get('type')
                 start_str = action.get('start')
                 end_str = action.get('end')
@@ -122,7 +118,7 @@ def parse_slope_metadata(zip_file):
                     except Exception:
                         continue
             if segments:
-                st.success(f"✅ {len(segments)} segments (Lifts/Runs) détectés dans le XML.")
+                st.success(f"✅ {len(segments)} segments (Lifts/Runs) détectés.")
             else:
                 st.warning("⚠️ Aucun segment 'Action' trouvé dans le XML.")
             return segments
@@ -133,19 +129,18 @@ def parse_slope_metadata(zip_file):
 def identify_gps_columns(df_raw):
     """
     Détecte intelligemment les colonnes Time, Lat, Lon, Alt.
-    Affiche un aperçu si échec.
+    Fonctionne maintenant que les colonnes sont correctement séparées.
     """
-    st.text("🔍 Analyse de la structure du CSV en cours...")
+    st.text("🔍 Identification des colonnes GPS en cours...")
     
     if df_raw.empty:
         st.error("Le fichier CSV est vide.")
         return None
 
-    # On cherche une ligne avec des données numériques (pas les headers)
+    # On cherche la première ligne avec des données numériques cohérentes
     sample_row = None
-    for i in range(min(10, len(df_raw))): # On regarde jusqu'à 10 lignes
+    for i in range(min(10, len(df_raw))):
         row_vals = df_raw.iloc[i].values
-        # On vérifie si on peut convertir en float
         valid_floats = 0
         for val in row_vals:
             try:
@@ -153,28 +148,27 @@ def identify_gps_columns(df_raw):
                 valid_floats += 1
             except:
                 pass
-        # Si on a au moins 3 nombres sur 5, c'est probablement une ligne de données
+        # Si on a au moins 3 nombres valides, c'est une ligne de données
         if valid_floats >= 3:
             sample_row = row_vals
-            st.text(f"Ligne de données détectée à l'index {i} : {sample_row[:3]}...")
             break
             
     if sample_row is None:
-        st.error("Impossible de trouver une ligne de données valides dans les 10 premières lignes.")
+        st.error("Impossible de trouver une ligne de données valides.")
         st.dataframe(df_raw.head(10))
         return None
 
     mapping = {'time': None, 'lat': None, 'lon': None, 'ele': None}
     
-    # Heuristiques d'identification
+    # Heuristiques
     for idx, val in enumerate(sample_row):
         try:
             num_val = float(val)
         except:
-            continue # On ignore les colonnes textes (headers ou strings)
+            continue 
             
         if mapping['time'] is None:
-            if num_val > 1_000_000_000: # Timestamp Unix > 2001
+            if num_val > 1_000_000_000: # Timestamp Unix
                 mapping['time'] = idx
                 
         if mapping['lat'] is None:
@@ -193,15 +187,11 @@ def identify_gps_columns(df_raw):
         st.text(f"Colonnes identifiées -> Time:{mapping['time']}, Lat:{mapping['lat']}, Lon:{mapping['lon']}, Alt:{mapping['ele']}")
         return [mapping['time'], mapping['lat'], mapping['lon'], mapping['ele']]
     else:
-        st.error("Échec de l'identification automatique des colonnes GPS.")
-        st.write("Valeurs trouvées :")
-        st.write(mapping)
-        st.write("Premières lignes brutes :")
-        st.dataframe(df_raw.head())
+        st.error("Échec de l'identification automatique.")
         return None
 
 def load_slope_file(uploaded_file):
-    """Charge le fichier .slopes (ZIP) avec logs détaillés."""
+    """Charge le fichier .slopes (ZIP) avec séparateur universel."""
     try:
         st.info("📂 0/3 : Ouverture de l'archive ZIP...")
         with zipfile.ZipFile(uploaded_file, 'r') as z:
@@ -209,7 +199,6 @@ def load_slope_file(uploaded_file):
             # --- 1. XML ---
             metadata_segments = parse_slope_metadata(z)
             if metadata_segments is None:
-                # On continue quand même pour essayer de lire le GPS, mais on prévient
                 pass 
 
             # --- 2. CSV ---
@@ -226,14 +215,16 @@ def load_slope_file(uploaded_file):
                         break
 
             if not target_csv:
-                st.error("Aucun fichier GPS (GPS.csv ou RawGPS.csv) trouvé dans l'archive.")
+                st.error("Aucun fichier GPS (GPS.csv ou RawGPS.csv) trouvé.")
                 return None, None
 
             st.text(f"Fichier trouvé : {target_csv}")
 
             with z.open(target_csv) as f:
-                # Lecture brute
-                df_raw = pd.read_csv(f, sep='|', engine='python', header=None, on_bad_lines='skip')
+                # --- LE CORRECTIF ICI ---
+                # On utilise une Regex pour accepter Pipe, Virgule OU Tabulation comme séparateur.
+                # Cela gère les formats : "0 | 1 | 2" ET "0 \t 1,2,3,4"
+                df_raw = pd.read_csv(f, sep=r'[|,\t]', engine='python', header=None, on_bad_lines='skip')
                 
                 if df_raw.empty:
                     st.error("Le fichier CSV est vide.")
@@ -250,7 +241,7 @@ def load_slope_file(uploaded_file):
                 
                 idx_time, idx_lat, idx_lon, idx_ele = indices
                 
-                # Sélection sécurisée (vérification bounds)
+                # Vérification bounds
                 max_idx = max(indices)
                 if max_idx >= len(df_raw.columns):
                     st.error(f"Erreur critique : Index de colonne {max_idx} supérieur au nombre de colonnes ({len(df_raw.columns)})")
@@ -283,7 +274,7 @@ def load_slope_file(uploaded_file):
         return None, None
 
 # --- CORE LOGIC ---
-# (Identique au code précédent, mais on s'assure que smooth_series est safe)
+
 class SkiRun:
     def __init__(self, run_id, df_segment):
         self.id = run_id
@@ -542,14 +533,13 @@ def main():
                     st.stop()
 
                 if metadata is None:
-                    st.warning("⚠️ Les métadonnées XML n'ont pas pu être lues. L'analyse des descentes risque d'être imprécise.")
+                    st.warning("⚠️ Les métadonnées XML n'ont pas pu être lues.")
 
                 session = SkiSession(raw_df, user_weight, metadata_segments=metadata)
                 
             st.success(f"Session analysée : {len(session.runs)} descentes détectées.")
             stats = session.get_global_stats()
 
-            # --- REPLAY / SLIDER ---
             st.sidebar.subheader("⏱️ Replay Temporel")
             min_time = session.df['time'].min().to_pydatetime()
             max_time = session.df['time'].max().to_pydatetime()
@@ -644,9 +634,9 @@ def main():
 
         except Exception as e:
             st.error("Une erreur critique est survenue.")
-            st.exception(e) # Affiche le traceback complet dans l'interface
+            st.exception(e)
     else:
-        st.title("Ski Analytics Pro - Debug Edition")
+        st.title("Ski Analytics Pro - Slopes Edition")
         st.info("Veuillez charger un fichier .slopes.")
 
 if __name__ == "__main__":
