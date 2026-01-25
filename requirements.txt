@@ -6,3 +6,4 @@ plotly
 pydeck
 haversine
 requests
+scipy
