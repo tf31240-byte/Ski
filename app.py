@@ -242,7 +242,10 @@ def enrich_gps(df: pd.DataFrame) -> pd.DataFrame:
     
     # Lissage de la vitesse pour réduire le bruit GPS
     if len(df) > 11:
-        df['speed_ms'] = savgol_filter(df['speed_raw'], 11, 2)
+        try:
+            df['speed_ms'] = savgol_filter(df['speed_raw'], 11, 2)
+        except:
+            df['speed_ms'] = df['speed_raw']  # Fallback si lissage échoue
     else:
         df['speed_ms'] = df['speed_raw']
     
@@ -250,7 +253,10 @@ def enrich_gps(df: pd.DataFrame) -> pd.DataFrame:
     
     # Altitude lissée (réduit le bruit altimétrique)
     if len(df) > 21:
-        df['ele_smooth'] = savgol_filter(df['ele'], 21, 3)
+        try:
+            df['ele_smooth'] = savgol_filter(df['ele'], 21, 3)
+        except:
+            df['ele_smooth'] = df['ele']  # Fallback
     else:
         df['ele_smooth'] = df['ele']
     
@@ -259,13 +265,19 @@ def enrich_gps(df: pd.DataFrame) -> pd.DataFrame:
     df['gradient'] = np.where(df['dist'] > 0.5, 
                              -(df['ele_smooth'].diff() / df['dist']) * 100, 0)
     
+    # Nettoyage des valeurs aberrantes avant lissage
+    df['gradient'] = df['gradient'].replace([np.inf, -np.inf], 0).fillna(0)
+    
     if len(df) > 21:
-        df['gradient'] = savgol_filter(df['gradient'], 21, 3)
+        try:
+            df['gradient'] = savgol_filter(df['gradient'], 21, 3)
+        except:
+            pass  # Si le lissage échoue, on garde les valeurs brutes
     
     # Forces G LONGITUDINALES (accélération/freinage)
     # a = dv/dt, g = a / 9.81
     df['accel'] = df['speed_ms'].diff() / df['dt'].replace(0, np.nan)
-    df['g_long'] = (df['accel'].abs() / 9.81).fillna(0).clip(0, 5)
+    df['g_long'] = (df['accel'].abs() / 9.81).replace([np.inf, -np.inf], 0).fillna(0).clip(0, 5)
     
     # Forces G LATÉRALES (virages) - FORMULE CORRIGÉE
     # Calcul du bearing (cap/direction)
@@ -291,7 +303,7 @@ def enrich_gps(df: pd.DataFrame) -> pd.DataFrame:
     # Force centripète: a_c = v² / R
     # G latéral = a_c / g
     df['centripetal_accel'] = df['speed_ms']**2 / df['radius']
-    df['g_lat'] = (df['centripetal_accel'] / 9.81).clip(0, 5)
+    df['g_lat'] = (df['centripetal_accel'] / 9.81).replace([np.inf, -np.inf], 0).fillna(0).clip(0, 5)
     
     # Angle de virage (pour analyse du carving)
     df['turn_angle'] = df['bearing_diff'].clip(-180, 180)
